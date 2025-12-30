@@ -213,4 +213,11 @@ impl Extractor {
 
         Ok(report)
     }
+
+    /// Extract from a file path. Convenience wrapper around `extract()`.
+    pub fn extract_file<P: AsRef<Path>>(&self, path: P) -> Result<Report, Error> {
+        let file = fs::File::open(path)?;
+        let reader = std::io::BufReader::new(file);
+        self.extract(reader)
+    }
 }

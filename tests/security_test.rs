@@ -1,6 +1,6 @@
 use safe_unzip::{Extractor, Error};
-use std::io::Write;
-use tempfile::tempdir;
+use std::io::{Write, Seek};
+use tempfile::{tempdir, NamedTempFile};
 use zip::write::FileOptions;
 
 fn create_malicious_zip() -> std::io::Result<std::fs::File> {
@@ -79,4 +79,36 @@ fn test_limits_quota() {
         }
         _ => panic!("❌ Failed to enforce quota"),
     }
+}
+
+#[test]
+fn test_extract_file_method() {
+    // Create a valid zip file on disk
+    let mut zip_file = NamedTempFile::new().unwrap();
+    {
+        let mut zip = zip::ZipWriter::new(&mut zip_file);
+        let options: FileOptions<()> = FileOptions::default();
+        zip.start_file("hello.txt", options).unwrap();
+        zip.write_all(b"Hello, World!").unwrap();
+        zip.finish().unwrap();
+    }
+    
+    // Reset file position to beginning (important!)
+    zip_file.seek(std::io::SeekFrom::Start(0)).unwrap();
+    
+    // Extract using the new extract_file method
+    let dest = tempdir().unwrap();
+    let report = Extractor::new(dest.path())
+        .unwrap()
+        .extract_file(zip_file.path())
+        .unwrap();
+    
+    assert_eq!(report.files_extracted, 1);
+    assert_eq!(report.bytes_written, 13); // "Hello, World!" = 13 bytes
+    
+    // Verify file exists and has correct content
+    let content = std::fs::read_to_string(dest.path().join("hello.txt")).unwrap();
+    assert_eq!(content, "Hello, World!");
+    
+    println!("✅ extract_file() works correctly");
 }
