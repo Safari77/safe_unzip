@@ -3,8 +3,8 @@ mod extractor;
 mod limits;
 
 pub use error::Error;
+pub use extractor::{EntryInfo, ExtractionMode, Extractor, OverwritePolicy, Report, SymlinkPolicy};
 pub use limits::Limits;
-pub use extractor::{Extractor, OverwritePolicy, SymlinkPolicy, ExtractionMode, Report, EntryInfo};
 
 /// Extract from a reader with default settings.
 ///

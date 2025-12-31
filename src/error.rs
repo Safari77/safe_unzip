@@ -59,7 +59,7 @@ fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
     const GB: u64 = 1024 * MB;
-    
+
     if bytes >= GB {
         format!("{:.1} GB", bytes as f64 / GB as f64)
     } else if bytes >= MB {
@@ -78,11 +78,15 @@ impl fmt::Display for Error {
                 write!(f, "path '{}' escapes destination: {}", entry, detail)
             }
             Self::SymlinkNotAllowed { entry } => {
-                write!(f, "archive contains symlink '{}' (symlinks not allowed)", entry)
+                write!(
+                    f,
+                    "archive contains symlink '{}' (symlinks not allowed)",
+                    entry
+                )
             }
             Self::TotalSizeExceeded { limit, would_be } => {
                 write!(
-                    f, 
+                    f,
                     "extraction would write {}, exceeding the {} limit",
                     format_bytes(*would_be),
                     format_bytes(*limit)
@@ -90,21 +94,25 @@ impl fmt::Display for Error {
             }
             Self::FileCountExceeded { limit, attempted } => {
                 write!(
-                    f, 
+                    f,
                     "archive contains {} files, exceeding the {} file limit",
                     attempted, limit
                 )
             }
             Self::FileTooLarge { entry, limit, size } => {
                 write!(
-                    f, 
+                    f,
                     "file '{}' is {} (limit: {})",
                     entry,
                     format_bytes(*size),
                     format_bytes(*limit)
                 )
             }
-            Self::SizeMismatch { entry, declared, actual } => {
+            Self::SizeMismatch {
+                entry,
+                declared,
+                actual,
+            } => {
                 write!(
                     f,
                     "file '{}' decompressed to {} but declared {} (possible zip bomb)",
@@ -113,9 +121,13 @@ impl fmt::Display for Error {
                     format_bytes(*declared)
                 )
             }
-            Self::PathTooDeep { entry, depth, limit } => {
+            Self::PathTooDeep {
+                entry,
+                depth,
+                limit,
+            } => {
                 write!(
-                    f, 
+                    f,
                     "path '{}' has {} directory levels (limit: {})",
                     entry, depth, limit
                 )
@@ -149,11 +161,17 @@ impl std::error::Error for Error {
 
 // Automatic conversions for ease of use
 impl From<zip::result::ZipError> for Error {
-    fn from(e: zip::result::ZipError) -> Self { Self::Zip(e) }
+    fn from(e: zip::result::ZipError) -> Self {
+        Self::Zip(e)
+    }
 }
 impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self { Self::Io(e) }
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
 }
 impl From<path_jail::JailError> for Error {
-    fn from(e: path_jail::JailError) -> Self { Self::Jail(e) }
+    fn from(e: path_jail::JailError) -> Self {
+        Self::Jail(e)
+    }
 }

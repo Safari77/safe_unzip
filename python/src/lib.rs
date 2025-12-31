@@ -1,5 +1,5 @@
-use pyo3::prelude::*;
 use pyo3::exceptions::{PyIOError, PyValueError};
+use pyo3::prelude::*;
 use std::path::PathBuf;
 
 // ============================================================================
@@ -17,27 +17,38 @@ fn to_py_err(err: safe_unzip::Error) -> PyErr {
         safe_unzip::Error::PathEscape { entry, detail } => {
             PathEscapeError::new_err(format!("path '{}' escapes destination: {}", entry, detail))
         }
-        safe_unzip::Error::SymlinkNotAllowed { entry } => {
-            SymlinkNotAllowedError::new_err(format!("archive contains symlink '{}' (symlinks not allowed)", entry))
-        }
-        safe_unzip::Error::TotalSizeExceeded { limit, would_be } => {
-            QuotaError::new_err(format!("extraction would write {} bytes, exceeding the {} byte limit", would_be, limit))
-        }
-        safe_unzip::Error::FileCountExceeded { limit, attempted } => {
-            QuotaError::new_err(format!("archive contains {} files, exceeding the {} file limit", attempted, limit))
-        }
-        safe_unzip::Error::FileTooLarge { entry, limit, size } => {
-            QuotaError::new_err(format!("file '{}' is {} bytes (limit: {} bytes)", entry, size, limit))
-        }
-        safe_unzip::Error::SizeMismatch { entry, declared, actual } => {
-            QuotaError::new_err(format!(
-                "file '{}' decompressed to {} bytes but declared {} bytes (possible zip bomb)",
-                entry, actual, declared
-            ))
-        }
-        safe_unzip::Error::PathTooDeep { entry, depth, limit } => {
-            QuotaError::new_err(format!("path '{}' has {} directory levels (limit: {})", entry, depth, limit))
-        }
+        safe_unzip::Error::SymlinkNotAllowed { entry } => SymlinkNotAllowedError::new_err(format!(
+            "archive contains symlink '{}' (symlinks not allowed)",
+            entry
+        )),
+        safe_unzip::Error::TotalSizeExceeded { limit, would_be } => QuotaError::new_err(format!(
+            "extraction would write {} bytes, exceeding the {} byte limit",
+            would_be, limit
+        )),
+        safe_unzip::Error::FileCountExceeded { limit, attempted } => QuotaError::new_err(format!(
+            "archive contains {} files, exceeding the {} file limit",
+            attempted, limit
+        )),
+        safe_unzip::Error::FileTooLarge { entry, limit, size } => QuotaError::new_err(format!(
+            "file '{}' is {} bytes (limit: {} bytes)",
+            entry, size, limit
+        )),
+        safe_unzip::Error::SizeMismatch {
+            entry,
+            declared,
+            actual,
+        } => QuotaError::new_err(format!(
+            "file '{}' decompressed to {} bytes but declared {} bytes (possible zip bomb)",
+            entry, actual, declared
+        )),
+        safe_unzip::Error::PathTooDeep {
+            entry,
+            depth,
+            limit,
+        } => QuotaError::new_err(format!(
+            "path '{}' has {} directory levels (limit: {})",
+            entry, depth, limit
+        )),
         safe_unzip::Error::AlreadyExists { path } => {
             AlreadyExistsError::new_err(format!("file '{}' already exists", path))
         }
@@ -47,12 +58,8 @@ fn to_py_err(err: safe_unzip::Error) -> PyErr {
         safe_unzip::Error::DestinationNotFound { path } => {
             PyIOError::new_err(format!("destination directory '{}' does not exist", path))
         }
-        safe_unzip::Error::Zip(e) => {
-            PyValueError::new_err(format!("zip format error: {}", e))
-        }
-        safe_unzip::Error::Io(e) => {
-            PyIOError::new_err(format!("I/O error: {}", e))
-        }
+        safe_unzip::Error::Zip(e) => PyValueError::new_err(format!("zip format error: {}", e)),
+        safe_unzip::Error::Io(e) => PyIOError::new_err(format!("I/O error: {}", e)),
         safe_unzip::Error::Jail(e) => {
             PathEscapeError::new_err(format!("path validation error: {}", e))
         }
@@ -162,8 +169,8 @@ impl PyExtractor {
                 Ok(slf)
             }
             _ => Err(PyValueError::new_err(
-                "overwrite must be 'error', 'skip', or 'overwrite'"
-            ))
+                "overwrite must be 'error', 'skip', or 'overwrite'",
+            )),
         }
     }
 
@@ -174,9 +181,7 @@ impl PyExtractor {
                 slf.symlinks = policy;
                 Ok(slf)
             }
-            _ => Err(PyValueError::new_err(
-                "symlinks must be 'skip' or 'error'"
-            ))
+            _ => Err(PyValueError::new_err("symlinks must be 'skip' or 'error'")),
         }
     }
 
@@ -188,8 +193,8 @@ impl PyExtractor {
                 Ok(slf)
             }
             _ => Err(PyValueError::new_err(
-                "mode must be 'streaming' or 'validate_first'"
-            ))
+                "mode must be 'streaming' or 'validate_first'",
+            )),
         }
     }
 
@@ -211,9 +216,8 @@ impl PyExtractor {
 
 impl PyExtractor {
     fn build_extractor(&self) -> PyResult<safe_unzip::Extractor> {
-        let mut extractor = safe_unzip::Extractor::new(&self.destination)
-            .map_err(to_py_err)?;
-        
+        let mut extractor = safe_unzip::Extractor::new(&self.destination).map_err(to_py_err)?;
+
         extractor = extractor.limits(safe_unzip::Limits {
             max_total_bytes: self.max_total_bytes,
             max_file_count: self.max_file_count,
@@ -270,17 +274,23 @@ fn _safe_unzip(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Classes
     m.add_class::<PyExtractor>()?;
     m.add_class::<PyReport>()?;
-    
+
     // Functions
     m.add_function(wrap_pyfunction!(extract_file, m)?)?;
     m.add_function(wrap_pyfunction!(extract_bytes, m)?)?;
-    
+
     // Exceptions
     m.add("SafeUnzipError", py.get_type_bound::<SafeUnzipError>())?;
     m.add("PathEscapeError", py.get_type_bound::<PathEscapeError>())?;
-    m.add("SymlinkNotAllowedError", py.get_type_bound::<SymlinkNotAllowedError>())?;
+    m.add(
+        "SymlinkNotAllowedError",
+        py.get_type_bound::<SymlinkNotAllowedError>(),
+    )?;
     m.add("QuotaError", py.get_type_bound::<QuotaError>())?;
-    m.add("AlreadyExistsError", py.get_type_bound::<AlreadyExistsError>())?;
-    
+    m.add(
+        "AlreadyExistsError",
+        py.get_type_bound::<AlreadyExistsError>(),
+    )?;
+
     Ok(())
 }
