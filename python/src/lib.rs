@@ -1,0 +1,280 @@
+use pyo3::prelude::*;
+use pyo3::exceptions::{PyIOError, PyValueError};
+use std::path::PathBuf;
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+pyo3::create_exception!(safe_unzip, SafeUnzipError, pyo3::exceptions::PyException);
+pyo3::create_exception!(safe_unzip, PathEscapeError, SafeUnzipError);
+pyo3::create_exception!(safe_unzip, SymlinkNotAllowedError, SafeUnzipError);
+pyo3::create_exception!(safe_unzip, QuotaError, SafeUnzipError);
+pyo3::create_exception!(safe_unzip, AlreadyExistsError, SafeUnzipError);
+
+fn to_py_err(err: safe_unzip::Error) -> PyErr {
+    match err {
+        safe_unzip::Error::PathEscape { entry, detail } => {
+            PathEscapeError::new_err(format!("Path escape in '{}': {}", entry, detail))
+        }
+        safe_unzip::Error::SymlinkNotAllowed { entry } => {
+            SymlinkNotAllowedError::new_err(format!("Symlink not allowed: '{}'", entry))
+        }
+        safe_unzip::Error::TotalSizeExceeded { limit, would_be } => {
+            QuotaError::new_err(format!("Total size {} exceeds limit {}", would_be, limit))
+        }
+        safe_unzip::Error::FileCountExceeded { limit } => {
+            QuotaError::new_err(format!("File count exceeds limit {}", limit))
+        }
+        safe_unzip::Error::FileTooLarge { entry, limit, size } => {
+            QuotaError::new_err(format!("'{}' size {} exceeds limit {}", entry, size, limit))
+        }
+        safe_unzip::Error::PathTooDeep { entry, depth, limit } => {
+            QuotaError::new_err(format!("'{}' depth {} exceeds limit {}", entry, depth, limit))
+        }
+        safe_unzip::Error::AlreadyExists { path } => {
+            AlreadyExistsError::new_err(format!("File already exists: '{}'", path))
+        }
+        safe_unzip::Error::InvalidFilename { entry } => {
+            PathEscapeError::new_err(format!("Invalid filename: '{}'", entry))
+        }
+        safe_unzip::Error::DestinationNotFound { path } => {
+            PyIOError::new_err(format!("Destination not found: '{}'", path))
+        }
+        safe_unzip::Error::Zip(e) => {
+            PyValueError::new_err(format!("Zip error: {}", e))
+        }
+        safe_unzip::Error::Io(e) => {
+            PyIOError::new_err(format!("IO error: {}", e))
+        }
+        safe_unzip::Error::Jail(e) => {
+            PathEscapeError::new_err(format!("Jail error: {}", e))
+        }
+    }
+}
+
+// ============================================================================
+// Report
+// ============================================================================
+
+#[pyclass(name = "Report")]
+#[derive(Clone)]
+struct PyReport {
+    #[pyo3(get)]
+    files_extracted: usize,
+    #[pyo3(get)]
+    dirs_created: usize,
+    #[pyo3(get)]
+    bytes_written: u64,
+    #[pyo3(get)]
+    entries_skipped: usize,
+}
+
+#[pymethods]
+impl PyReport {
+    fn __repr__(&self) -> String {
+        format!(
+            "Report(files_extracted={}, dirs_created={}, bytes_written={}, entries_skipped={})",
+            self.files_extracted, self.dirs_created, self.bytes_written, self.entries_skipped
+        )
+    }
+}
+
+impl From<safe_unzip::Report> for PyReport {
+    fn from(r: safe_unzip::Report) -> Self {
+        PyReport {
+            files_extracted: r.files_extracted,
+            dirs_created: r.dirs_created,
+            bytes_written: r.bytes_written,
+            entries_skipped: r.entries_skipped,
+        }
+    }
+}
+
+// ============================================================================
+// Extractor
+// ============================================================================
+
+#[pyclass(name = "Extractor")]
+struct PyExtractor {
+    destination: PathBuf,
+    max_total_bytes: u64,
+    max_file_count: usize,
+    max_single_file: u64,
+    max_path_depth: usize,
+    overwrite: String,
+    symlinks: String,
+    mode: String,
+}
+
+#[pymethods]
+impl PyExtractor {
+    #[new]
+    fn new(destination: PathBuf) -> Self {
+        let defaults = safe_unzip::Limits::default();
+        PyExtractor {
+            destination,
+            max_total_bytes: defaults.max_total_bytes,
+            max_file_count: defaults.max_file_count,
+            max_single_file: defaults.max_single_file,
+            max_path_depth: defaults.max_path_depth,
+            overwrite: "error".to_string(),
+            symlinks: "skip".to_string(),
+            mode: "streaming".to_string(),
+        }
+    }
+
+    /// Set maximum total bytes to extract.
+    fn max_total_mb(mut slf: PyRefMut<'_, Self>, mb: u64) -> PyRefMut<'_, Self> {
+        slf.max_total_bytes = mb * 1024 * 1024;
+        slf
+    }
+
+    /// Set maximum number of files to extract.
+    fn max_files(mut slf: PyRefMut<'_, Self>, count: usize) -> PyRefMut<'_, Self> {
+        slf.max_file_count = count;
+        slf
+    }
+
+    /// Set maximum size of a single file.
+    fn max_single_file_mb(mut slf: PyRefMut<'_, Self>, mb: u64) -> PyRefMut<'_, Self> {
+        slf.max_single_file = mb * 1024 * 1024;
+        slf
+    }
+
+    /// Set maximum directory depth.
+    fn max_depth(mut slf: PyRefMut<'_, Self>, depth: usize) -> PyRefMut<'_, Self> {
+        slf.max_path_depth = depth;
+        slf
+    }
+
+    /// Set overwrite policy: "error", "skip", or "overwrite".
+    fn overwrite(mut slf: PyRefMut<'_, Self>, policy: String) -> PyResult<PyRefMut<'_, Self>> {
+        match policy.as_str() {
+            "error" | "skip" | "overwrite" => {
+                slf.overwrite = policy;
+                Ok(slf)
+            }
+            _ => Err(PyValueError::new_err(
+                "overwrite must be 'error', 'skip', or 'overwrite'"
+            ))
+        }
+    }
+
+    /// Set symlink policy: "skip" or "error".
+    fn symlinks(mut slf: PyRefMut<'_, Self>, policy: String) -> PyResult<PyRefMut<'_, Self>> {
+        match policy.as_str() {
+            "skip" | "error" => {
+                slf.symlinks = policy;
+                Ok(slf)
+            }
+            _ => Err(PyValueError::new_err(
+                "symlinks must be 'skip' or 'error'"
+            ))
+        }
+    }
+
+    /// Set extraction mode: "streaming" or "validate_first".
+    fn mode(mut slf: PyRefMut<'_, Self>, mode: String) -> PyResult<PyRefMut<'_, Self>> {
+        match mode.as_str() {
+            "streaming" | "validate_first" => {
+                slf.mode = mode;
+                Ok(slf)
+            }
+            _ => Err(PyValueError::new_err(
+                "mode must be 'streaming' or 'validate_first'"
+            ))
+        }
+    }
+
+    /// Extract from a file path.
+    fn extract_file(&self, path: PathBuf) -> PyResult<PyReport> {
+        let extractor = self.build_extractor()?;
+        let report = extractor.extract_file(path).map_err(to_py_err)?;
+        Ok(report.into())
+    }
+
+    /// Extract from bytes.
+    fn extract_bytes(&self, data: &[u8]) -> PyResult<PyReport> {
+        let extractor = self.build_extractor()?;
+        let cursor = std::io::Cursor::new(data.to_vec());
+        let report = extractor.extract(cursor).map_err(to_py_err)?;
+        Ok(report.into())
+    }
+}
+
+impl PyExtractor {
+    fn build_extractor(&self) -> PyResult<safe_unzip::Extractor> {
+        let mut extractor = safe_unzip::Extractor::new(&self.destination)
+            .map_err(to_py_err)?;
+        
+        extractor = extractor.limits(safe_unzip::Limits {
+            max_total_bytes: self.max_total_bytes,
+            max_file_count: self.max_file_count,
+            max_single_file: self.max_single_file,
+            max_path_depth: self.max_path_depth,
+        });
+
+        extractor = match self.overwrite.as_str() {
+            "skip" => extractor.overwrite(safe_unzip::OverwritePolicy::Skip),
+            "overwrite" => extractor.overwrite(safe_unzip::OverwritePolicy::Overwrite),
+            _ => extractor.overwrite(safe_unzip::OverwritePolicy::Error),
+        };
+
+        extractor = match self.symlinks.as_str() {
+            "error" => extractor.symlinks(safe_unzip::SymlinkPolicy::Error),
+            _ => extractor.symlinks(safe_unzip::SymlinkPolicy::Skip),
+        };
+
+        extractor = match self.mode.as_str() {
+            "validate_first" => extractor.mode(safe_unzip::ExtractionMode::ValidateFirst),
+            _ => extractor.mode(safe_unzip::ExtractionMode::Streaming),
+        };
+
+        Ok(extractor)
+    }
+}
+
+// ============================================================================
+// Convenience Functions
+// ============================================================================
+
+/// Extract a zip file with default settings.
+#[pyfunction]
+fn extract_file(destination: PathBuf, path: PathBuf) -> PyResult<PyReport> {
+    let report = safe_unzip::extract_file(&destination, &path).map_err(to_py_err)?;
+    Ok(report.into())
+}
+
+/// Extract from bytes with default settings.
+#[pyfunction]
+fn extract_bytes(destination: PathBuf, data: &[u8]) -> PyResult<PyReport> {
+    let cursor = std::io::Cursor::new(data.to_vec());
+    let extractor = safe_unzip::Extractor::new(&destination).map_err(to_py_err)?;
+    let report = extractor.extract(cursor).map_err(to_py_err)?;
+    Ok(report.into())
+}
+
+// ============================================================================
+// Module
+// ============================================================================
+
+#[pymodule]
+fn _safe_unzip(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Classes
+    m.add_class::<PyExtractor>()?;
+    m.add_class::<PyReport>()?;
+    
+    // Functions
+    m.add_function(wrap_pyfunction!(extract_file, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_bytes, m)?)?;
+    
+    // Exceptions
+    m.add("SafeUnzipError", py.get_type_bound::<SafeUnzipError>())?;
+    m.add("PathEscapeError", py.get_type_bound::<PathEscapeError>())?;
+    m.add("SymlinkNotAllowedError", py.get_type_bound::<SymlinkNotAllowedError>())?;
+    m.add("QuotaError", py.get_type_bound::<QuotaError>())?;
+    m.add("AlreadyExistsError", py.get_type_bound::<AlreadyExistsError>())?;
+    
+    Ok(())
+}

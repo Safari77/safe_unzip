@@ -34,6 +34,9 @@ pub enum Error {
     /// Destination directory does not exist or is invalid.
     DestinationNotFound { path: String },
 
+    /// Filename contains invalid characters or reserved names.
+    InvalidFilename { entry: String },
+
     /// Zip format error.
     Zip(zip::result::ZipError),
 
@@ -70,6 +73,9 @@ impl fmt::Display for Error {
             }
             Self::DestinationNotFound { path } => {
                 write!(f, "destination directory not found: '{}'", path)
+            }
+            Self::InvalidFilename { entry } => {
+                write!(f, "security error: invalid filename: '{}'", entry)
             }
             Self::Zip(e) => write!(f, "zip error: {}", e),
             Self::Io(e) => write!(f, "io error: {}", e),

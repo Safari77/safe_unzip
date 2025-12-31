@@ -1,0 +1,16 @@
+[package]
+name = "safe_unzip_python"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tenuo-ai/safe_unzip"
+authors = ["Niki A. <dev@tenuo.dev>"]
+description = "Python bindings for safe_unzip"
+
+[lib]
+name = "safe_unzip"
+crate-type = ["cdylib"]
+
+[dependencies]
+safe_unzip = { path = ".." }
+pyo3 = { version = "0.22", features = ["extension-module"] }

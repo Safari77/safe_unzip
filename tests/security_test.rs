@@ -433,3 +433,160 @@ fn test_creates_directories() {
     
     println!("✅ Directory creation works");
 }
+
+#[test]
+fn test_sanitize_filenames() {
+    let dest = tempdir().unwrap();
+    
+    // Test Windows reserved names
+    // ZIP spec allows basically anything, but we want to fail on "CON.txt"
+    let zip = create_simple_zip("CON.txt", b"safe");
+    let result = Extractor::new(dest.path()).unwrap().extract(zip);
+    
+    match result {
+        Err(Error::InvalidFilename { entry }) => {
+            assert_eq!(entry, "CON.txt");
+            println!("✅ Successfully rejected reserved filename: {}", entry);
+        }
+        _ => panic!("❌ Failed to reject reserved filename"),
+    }
+}
+
+#[test]
+fn test_symlink_overwrite_protection() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let dest = tempdir().unwrap();
+        
+        // Setup:
+        // jail/target.txt (sensitive)
+        // jail/link -> target.txt
+        let target_path = dest.path().join("target.txt");
+        let link_path = dest.path().join("link");
+        
+        std::fs::write(&target_path, "sensitive").unwrap();
+        symlink(&target_path, &link_path).unwrap();
+        
+        // Attack: Extract file named "link" with content "pwned"
+        // If secure, it should replace "link" with a file "pwned", and NOT write to "target.txt"
+        let zip = create_simple_zip("link", b"pwned");
+        
+        let report = Extractor::new(dest.path())
+            .unwrap()
+            .overwrite(OverwritePolicy::Overwrite)
+            .extract(zip)
+            .unwrap();
+            
+        assert_eq!(report.files_extracted, 1);
+        
+        // Verify 'link' is now a file with 'pwned'
+        let link_content = std::fs::read_to_string(&link_path).unwrap();
+        assert_eq!(link_content, "pwned");
+        assert!(!link_path.is_symlink());
+        
+        // Verify 'target.txt' is UNTOUCHED
+        let target_content = std::fs::read_to_string(&target_path).unwrap();
+        assert_eq!(target_content, "sensitive");
+        
+        println!("✅ Symlink overwrite protection works");
+    }
+}
+
+// Helper to modify zip bytes to fake size
+fn create_fake_size_zip(name: &str, content: &[u8], declared_size: u32) -> std::fs::File {
+    let mut file = tempfile::tempfile().unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options: FileOptions<()> = FileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .unix_permissions(0o644);
+        
+    zip.start_file(name, options).unwrap();
+    zip.write_all(content).unwrap();
+    let mut finalized_file = zip.finish().unwrap();
+    
+    // Rewind and read into buffer
+    finalized_file.seek(std::io::SeekFrom::Start(0)).unwrap();
+    let mut buffer = Vec::new();
+    use std::io::Read;
+    finalized_file.read_to_end(&mut buffer).unwrap();
+    
+    // Basic Zip structure hacking (Stored only):
+    // Local File Header signature: 0x04034b50
+    // ...
+    // Offset 18: Compressed size (4 bytes)
+    // Offset 22: Uncompressed size (4 bytes)
+    //
+    // We need to find the LFH for our file.
+    let lfh_sig = &[0x50, 0x4b, 0x03, 0x04];
+    if &buffer[0..4] == lfh_sig {
+        // Overwrite uncompressed size at 22
+        let size_bytes = declared_size.to_le_bytes();
+        buffer[22] = size_bytes[0];
+        buffer[23] = size_bytes[1];
+        buffer[24] = size_bytes[2];
+        buffer[25] = size_bytes[3];
+        
+        // Overwrite compressed size at 18
+        buffer[18] = size_bytes[0];
+        buffer[19] = size_bytes[1];
+        buffer[20] = size_bytes[2];
+        buffer[21] = size_bytes[3];
+        
+        // Also need to update Central Directory Header
+        // Signature: 0x02014b50
+        // Search for it
+        let cd_sig = &[0x50, 0x4b, 0x01, 0x02];
+        if let Some(pos) = buffer.windows(4).position(|w| w == cd_sig) {
+             // Offset 20: Compressed size
+             // Offset 24: Uncompressed size
+             buffer[pos + 20] = size_bytes[0];
+             buffer[pos + 21] = size_bytes[1];
+             buffer[pos + 22] = size_bytes[2];
+             buffer[pos + 23] = size_bytes[3];
+             
+             buffer[pos + 24] = size_bytes[0];
+             buffer[pos + 25] = size_bytes[1];
+             buffer[pos + 26] = size_bytes[2];
+             buffer[pos + 27] = size_bytes[3];
+        } else {
+             println!("⚠️ Could not find Central Directory");
+        }
+    } else {
+        println!("⚠️ Could not find LFH");
+    }
+    
+    let mut hacked_file = tempfile::tempfile().unwrap();
+    hacked_file.write_all(&buffer).unwrap();
+    hacked_file.seek(std::io::SeekFrom::Start(0)).unwrap();
+    hacked_file
+}
+
+#[test]
+fn test_strict_size_enforcement() {
+    let dest = tempdir().unwrap();
+    
+    // Create zip with 10 bytes content, but declare 5 bytes
+    let zip_file = create_fake_size_zip("lie.txt", b"0123456789", 5);
+    
+    // Attempt extract. Should fail because read returns more data than declared
+    let result = Extractor::new(dest.path())
+        .unwrap()
+        .extract(zip_file);
+        
+    match result {
+        Err(Error::FileTooLarge { limit, size, .. }) => {
+            // We expect limit=5 (declared), size=6 (attempted read)
+             assert_eq!(limit, 5);
+             assert_eq!(size, 6);
+             println!("✅ Successfully caught zip bomb verification failure");
+        }
+        Err(Error::Io(e)) if e.to_string().contains("Invalid checksum") => {
+             // The zip crate might catch the mismatch via CRC Checksum error 
+             // because our fake zip didn't update the CRC to match the fake size 
+             // (or the full content). This is also a valid rejection.
+             println!("✅ Successfully rejected zip bomb (checksum)");
+        }
+        _ => panic!("❌ Failed to enforce declared size: {:?}", result),
+    }
+}

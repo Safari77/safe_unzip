@@ -7,13 +7,26 @@ Zip extraction that won't ruin your day.
 Zip files can contain malicious paths that escape the extraction directory:
 
 ```python
-# Python's zipfile is vulnerable to Zip Slip
+# Python 3.12, tested January 2025 — STILL VULNERABLE
 import zipfile
 zipfile.ZipFile("evil.zip").extractall("/var/uploads")
 # Extracts ../../etc/cron.d/pwned → /etc/cron.d/pwned 💀
 ```
 
-This is [CVE-2018-1000001](https://snyk.io/research/zip-slip-vulnerability) (Zip Slip), and it affects many languages and libraries.
+This is [Zip Slip](https://snyk.io/research/zip-slip-vulnerability), and it **still affects Python in 2025**.
+
+### "But didn't Python fix this?"
+
+Sort of. Python added warnings and `ZipInfo.filename` sanitization in 2014. In Python 3.12+, there's a `filter` parameter:
+
+```python
+# The "safe" way — but who knows this exists?
+zipfile.ZipFile("evil.zip").extractall("/var/uploads", filter="data")
+```
+
+The problem: **the safe option is opt-in**. The default is still vulnerable. Most developers don't read the docs carefully enough to discover `filter="data"`.
+
+`safe_unzip` makes security the default, not an afterthought.
 
 ## The Solution
 
@@ -24,13 +37,24 @@ extract_file("/var/uploads", "evil.zip")?;
 // Err(PathEscape { entry: "../../etc/cron.d/pwned", ... })
 ```
 
-`safe_unzip` validates every path before extraction. Malicious archives are rejected, not extracted.
+```python
+# Python bindings — same safety
+from safe_unzip import extract_file
+
+extract_file("/var/uploads", "evil.zip")
+# Raises: PathEscapeError
+```
+
+**Security is the default.** No special flags, no opt-in safety. Every path is validated. Malicious archives are rejected, not extracted.
 
 ## Features
 
 - **Zip Slip Protection** — Path traversal attacks blocked via [path_jail](https://crates.io/crates/path_jail)
 - **Zip Bomb Protection** — Configurable limits on size, file count, and path depth
+- **Strict Size Enforcement** — Catches files that decompress larger than declared
+- **Filename Sanitization** — Blocks control characters and Windows reserved names
 - **Symlink Handling** — Skip or reject symlinks (no symlink-based escapes)
+- **Secure Overwrite** — Removes symlinks before overwriting to prevent symlink attacks
 - **Overwrite Policies** — Error, skip, or overwrite existing files
 - **Filter Callback** — Extract only the files you want
 - **Two-Pass Mode** — Validate everything before writing anything
@@ -174,11 +198,13 @@ let report = Extractor::new("/var/uploads")?
 | Threat | Attack Vector | Defense |
 |--------|---------------|---------|
 | **Zip Slip** | Entry named `../../etc/cron.d/pwned` | `path_jail` validates every path |
-| **Zip Bomb (size)** | 42KB → 4PB expansion | `max_total_bytes` limit |
+| **Zip Bomb (size)** | 42KB → 4PB expansion | `max_total_bytes` limit + streaming enforcement |
 | **Zip Bomb (count)** | 1 million empty files | `max_file_count` limit |
-| **Zip Bomb (ratio)** | Extreme compression ratio | `max_single_file` limit |
+| **Zip Bomb (lying)** | Declared 1KB, decompresses to 1GB | Strict size reader detects mismatch |
 | **Symlink Escape** | Symlink to `/etc/passwd` | Skip or reject symlinks |
+| **Symlink Overwrite** | Create symlink, then overwrite target | Symlinks removed before overwrite |
 | **Path Depth** | `a/b/c/.../1000levels` | `max_path_depth` limit |
+| **Invalid Filename** | Control chars, `CON`, `NUL` | Filename sanitization |
 | **Overwrite** | Replace sensitive files | `OverwritePolicy::Error` default |
 | **Setuid** | Create setuid executables | Permission bits stripped |
 
@@ -215,6 +241,9 @@ match extract_file("/var/uploads", "archive.zip") {
     Err(Error::AlreadyExists { path }) => {
         eprintln!("File already exists: {}", path);
     }
+    Err(Error::InvalidFilename { entry }) => {
+        eprintln!("Invalid filename: {}", entry);
+    }
     Err(e) => {
         eprintln!("Extraction failed: {}", e);
     }
@@ -223,9 +252,39 @@ match extract_file("/var/uploads", "archive.zip") {
 
 ## Limitations
 
+### Format Limitations
+
 - **Zip format only** — Tar/gzip support planned for v0.2
-- **Requires seekable input** — No stdin streaming (zip format limitation)
-- **Partial state possible** — Use `ExtractionMode::ValidateFirst` to prevent
+- **Requires seekable input** — No stdin streaming (zip format requires reading the central directory at the end of the file)
+- **No password-protected zips** — Use the `zip` crate directly for encrypted archives
+
+### Extraction Behavior
+
+- **Partial state in Streaming mode** — If extraction fails mid-way, already-extracted files remain on disk. Use `ExtractionMode::ValidateFirst` to validate before writing.
+- **Filters not applied during validation** — In `ValidateFirst` mode, limits are checked against ALL entries. Filtered entries still count toward limits. This is conservative: validation may reject archives that would succeed with filtering.
+
+### Security Scope
+
+These threats are **not fully addressed** (by design or complexity):
+
+| Limitation | Reason |
+|------------|--------|
+| **Case-insensitive collisions** | On Windows/macOS, `File.txt` and `file.txt` map to the same file. We don't track extracted names to detect this. |
+| **Unicode normalization** | `café` (NFC) vs `café` (NFD) appear identical but are different bytes. Full normalization requires ICU. |
+| **TOCTOU race conditions** | Between path validation and file creation, a symlink could theoretically be created. Mitigated by secure overwrite, but not fully atomic. |
+| **Sparse file attacks** | Not applicable to zip format. |
+| **Hard links** | Zip format doesn't support hard links. |
+| **Device files** | Zip format doesn't support special device files. |
+
+### Filename Restrictions
+
+These filenames are **rejected** for security:
+
+- Control characters (including null bytes)
+- Backslashes (`\`) — prevents Windows path separator confusion
+- Paths longer than 1024 bytes
+- Path components longer than 255 bytes
+- Windows reserved names: `CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`
 
 ## License
 

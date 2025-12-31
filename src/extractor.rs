@@ -49,6 +49,7 @@ pub struct EntryInfo<'a> {
 }
 
 pub struct Extractor {
+    root: std::path::PathBuf,
     jail: Jail,
     limits: Limits,
     overwrite: OverwritePolicy,
@@ -67,8 +68,9 @@ impl Extractor {
             });
         }
 
-        let jail = Jail::new(destination)?;
+        let jail = Jail::new(destination.as_ref())?;
         Ok(Self {
+            root: destination.as_ref().to_path_buf(),
             jail,
             limits: Limits::default(),
             overwrite: OverwritePolicy::default(),
@@ -120,14 +122,25 @@ impl Extractor {
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i)?;
             let name = entry.name().to_string();
+            // println!("DEBUG: Processing entry: {}", name);
+
+            // 0. SECURITY: Filename Sanitization
+            if !self.is_valid_filename(&name) {
+                return Err(Error::InvalidFilename { entry: name });
+            }
 
             // 1. SECURITY: Path Validation (Path Jail)
-            // We check this FIRST. Even if we skip the file later, 
-            // we want to know if it was malicious.
-            let safe_path = self.jail.join(&name).map_err(|e| Error::PathEscape {
+            // We check this FIRST to ensure the path is safe (doesn't escape root).
+            // NOTE: We discard the returned path because Jail might resolve symlinks (e.g. on overwrite),
+            // which causes us to overwrite the target instead of the symlink.
+            // We construct the path manually relative to root, which is safe because Jail verified it.
+            let _ = self.jail.join(&name).map_err(|e| Error::PathEscape {
                 entry: name.clone(),
                 detail: e.to_string(),
             })?;
+            
+            // Construct safe_path manually to preserve symlinks in the path
+            let safe_path = self.root.join(&name);
 
             // 2. CHECK: Symlinks
             if entry.is_symlink() {
@@ -170,13 +183,13 @@ impl Extractor {
                 }
             }
 
-            // 5. CHECK: Limits (Size & Count)
+            // 5. CHECK: Limits (Count & Lookahead Total)
             // Check file count
             if report.files_extracted >= self.limits.max_file_count {
                 return Err(Error::FileCountExceeded { limit: self.limits.max_file_count });
             }
 
-            // Check single file size
+            // Check single file size (declared)
             if !entry.is_dir() && entry.size() > self.limits.max_single_file {
                  return Err(Error::FileTooLarge {
                     entry: name,
@@ -185,7 +198,8 @@ impl Extractor {
                 });
             }
 
-            // Check total size (Lookahead)
+            // Check total size (Lookahead declared)
+            // Note: We ALSO check this during streaming to prevent zip bombs that lie about size
             if total_bytes_written + entry.size() > self.limits.max_total_bytes {
                 return Err(Error::TotalSizeExceeded {
                     limit: self.limits.max_total_bytes,
@@ -193,15 +207,48 @@ impl Extractor {
                 });
             }
 
-            // 6. CHECK: Overwrite Policy
-            if safe_path.exists() {
+            // println!("DEBUG: Checking existence - Path: {:?}, Exists: {}", safe_path, safe_path.exists());
+            if safe_path.exists() || fs::symlink_metadata(&safe_path).is_ok() {
                 match self.overwrite {
-                    OverwritePolicy::Error => return Err(Error::AlreadyExists { path: safe_path.display().to_string() }),
+                    OverwritePolicy::Error => {
+                        // Only error if it really exists (exists() handles symlinks too) but we want to be careful
+                        if safe_path.exists() {
+                             return Err(Error::AlreadyExists { path: safe_path.display().to_string() });
+                        }
+                    }
                     OverwritePolicy::Skip => {
-                        report.entries_skipped += 1;
-                        continue;
+                        if safe_path.exists() {
+                            report.entries_skipped += 1;
+                            continue;
+                        }
                     },
-                    OverwritePolicy::Overwrite => { /* Proceed */ }
+                    OverwritePolicy::Overwrite => {
+                        // SECURITY: Secure Overwrite
+                        // If it's a symlink, we MUST remove it to avoid following it.
+                        // If it's a file, we remove it to ensure clean state.
+                        // If it's a directory, we leave it (create_dir_all handles it), 
+                        // unless it's a file trying to overwrite a dir... handling that is complex, 
+                        // but fs::remove_file fails on dirs usually.
+                        
+                        // Use symlink_metadata to check type without following
+                        let meta = fs::symlink_metadata(&safe_path);
+                        if let Ok(m) = meta {
+                            if m.is_dir() {
+                                 if !entry.is_dir() {
+                                    // Trying to overwrite dir with file...
+                                    // For now, let File::create fail or do nothing
+                                 }
+                            } else {
+                                // Valid file or symlink - REMOVE IT
+                                if let Err(e) = fs::remove_file(&safe_path) {
+                                    // If it doesn't exist (race?), ignore. Else error.
+                                    if e.kind() != std::io::ErrorKind::NotFound {
+                                        return Err(Error::Io(e));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -214,8 +261,75 @@ impl Extractor {
                     fs::create_dir_all(parent)?;
                 }
                 
+                // SECURITY: LimitReader
+                // Enforce:
+                // 1. entry.size() (Declared size) - catch bombs that lie
+                // 2. limits.max_single_file - catch bombs exceeding limit
+                // 3. limits.max_total_bytes - catch global limit violation
+                
+                let limit_single = self.limits.max_single_file.min(entry.size());
+                let remaining_global = self.limits.max_total_bytes.saturating_sub(total_bytes_written);
+                let hard_limit = limit_single.min(remaining_global);
+
+                let mut limiter = LimitReader::new(&mut entry, hard_limit);
                 let mut outfile = fs::File::create(&safe_path)?;
-                let written = std::io::copy(&mut entry, &mut outfile)?;
+                
+                // We use io::copy, which loops until EOF or error.
+                // LimitReader returns EOF at limit.
+                // BUT we need to distinguish EOF at limit vs natural EOF.
+                // If EOF at limit AND entry has more data -> Error.
+                
+                let written = std::io::copy(&mut limiter, &mut outfile)?;
+                
+                // Check if we hit the limit strictly
+                if limiter.hit_limit {
+                    // If we hit the limit, we must check if there was MORE data expected.
+                    // If declared size > written, we stopped early -> OK? 
+                    // No, if we stopped because of max_single_file, it's an error if the file was larger.
+                    // If we stopped because of max_total_bytes, it's an error.
+                    // If we stopped because of entry.size(), it's fine (just consumed declared).
+                    
+                    // Actually, if we hit the hard_limit, we should check WHY.
+                    if written >= self.limits.max_single_file && entry.size() > self.limits.max_single_file {
+                         return Err(Error::FileTooLarge {
+                            entry: name,
+                            limit: self.limits.max_single_file,
+                            size: written + 1, // At least this much
+                        });
+                    }
+                    
+                    if remaining_global <= written && written < entry.size() {
+                        return Err(Error::TotalSizeExceeded {
+                            limit: self.limits.max_total_bytes,
+                            would_be: total_bytes_written + written + 1,
+                        });
+                    }
+                    
+                    // Specific check: if written == entry.size(), we are good.
+                    // If written < entry.size() but we hit limit, it means limit < entry.size().
+                    // Which implies one of the above errors triggered.
+                }
+
+                // If the file is a ZIP BOMB (decompresses to MORE than declared size),
+                // LimitReader will stop at declared size.
+                // We should error if there is still data in `entry`.
+                // But `zip` crate might not make it easy to peek.
+                // However, `copy` returns `written`. 
+                // If `written == hard_limit` (which is capped at `entry.size()`),
+                // and real data > `entry.size()`, we effectively truncated it.
+                // Ideally we error on mismatch.
+                // We can try valid_size check.
+                if written == entry.size() {
+                    // Try reading one more byte to see if there is more
+                    let mut buf = [0u8; 1];
+                    if entry.read(&mut buf)? > 0 {
+                         return Err(Error::FileTooLarge {
+                            entry: name.clone(),
+                            limit: entry.size(),
+                            size: entry.size() + 1,
+                        });
+                    }
+                }
                 
                 total_bytes_written += written;
                 report.bytes_written += written;
@@ -226,9 +340,9 @@ impl Extractor {
                 {
                     use std::os::unix::fs::PermissionsExt;
                     if let Some(mode) = entry.unix_mode() {
-                        // Strip dangerous bits (setuid, setgid, sticky)
-                        // 0o777 mask keeps only rwx flags
-                        let safe_mode = mode & 0o777; 
+                        // Strip setuid (0o4000), setgid (0o2000), sticky (0o1000) bits
+                        // 0o0777 mask keeps only owner/group/other rwx flags
+                        let safe_mode = mode & 0o0777;
                         fs::set_permissions(&safe_path, fs::Permissions::from_mode(safe_mode))?;
                     }
                 }
@@ -239,7 +353,15 @@ impl Extractor {
     }
 
     /// Validate all entries without extracting (fast dry run).
+    /// 
     /// Uses `by_index_raw()` to read metadata without decompressing.
+    /// 
+    /// **Note:** Filter callbacks are NOT applied during validation. This means:
+    /// - File count/size limits are checked against ALL entries
+    /// - Extraction may skip entries the filter rejects
+    /// - This is conservative: validation may reject archives that would succeed with filtering
+    /// 
+    /// This is intentional: filters are advisory, not security boundaries.
     fn validate_all<R: Read + Seek>(&self, archive: &mut zip::ZipArchive<R>) -> Result<(), Error> {
         let mut total_size: u64 = 0;
         let mut file_count: usize = 0;
@@ -248,6 +370,11 @@ impl Extractor {
             // by_index_raw reads metadata WITHOUT decompressing
             let entry = archive.by_index_raw(i)?;
             let name = entry.name().to_string();
+            
+            // 0. Filename sanitization
+            if !self.is_valid_filename(&name) {
+                return Err(Error::InvalidFilename { entry: name });
+            }
 
             // 1. Path validation (Zip Slip check)
             self.jail.join(&name).map_err(|e| Error::PathEscape {
@@ -311,5 +438,83 @@ impl Extractor {
         let file = fs::File::open(path)?;
         let reader = std::io::BufReader::new(file);
         self.extract(reader)
+    }
+
+    fn is_valid_filename(&self, name: &str) -> bool {
+        // Reject empty names
+        if name.is_empty() {
+            return false;
+        }
+        
+        // Reject control characters (includes null bytes)
+        if name.chars().any(|c| c.is_control()) {
+            return false;
+        }
+        
+        // Reject backslashes (Windows path separator could bypass Unix checks)
+        if name.contains('\\') {
+            return false;
+        }
+        
+        // Reject extremely long filenames (filesystem limits)
+        if name.len() > 1024 || name.split('/').any(|component| component.len() > 255) {
+            return false;
+        }
+
+        // Check path components for reserved names
+        let path = Path::new(name);
+        for component in path.components() {
+            if let Component::Normal(os_str) = component {
+                if let Some(s) = os_str.to_str() {
+                    // Windows reserved names
+                    let s_upper = s.to_ascii_uppercase();
+                    let file_stem = s_upper.split('.').next().unwrap_or(&s_upper);
+                    
+                    match file_stem {
+                        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | 
+                        "COM5" | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | 
+                        "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => return false,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
+// Helper struct to enforce read limits
+struct LimitReader<'a, R> {
+    inner: &'a mut R,
+    limit: u64,
+    bytes_read: u64,
+    hit_limit: bool,
+}
+
+impl<'a, R: Read> LimitReader<'a, R> {
+    fn new(inner: &'a mut R, limit: u64) -> Self {
+        Self { inner, limit, bytes_read: 0, hit_limit: false }
+    }
+}
+
+impl<'a, R: Read> Read for LimitReader<'a, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.bytes_read >= self.limit {
+            self.hit_limit = true;
+            return Ok(0);
+        }
+        
+        // Cap the read length to the limit
+        let remaining = self.limit - self.bytes_read;
+        let len = buf.len().min(remaining as usize);
+        
+        let n = self.inner.read(&mut buf[0..len])?;
+        self.bytes_read += n as u64;
+        
+        if self.bytes_read >= self.limit {
+            self.hit_limit = true;
+        }
+        
+        Ok(n)
     }
 }
