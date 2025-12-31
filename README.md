@@ -47,6 +47,28 @@ extract_file("/var/uploads", "evil.zip")
 
 **Security is the default.** No special flags, no opt-in safety. Every path is validated. Malicious archives are rejected, not extracted.
 
+## Why Not Just Use `zip` / `zipfile`?
+
+Because **archive extraction is a security boundary**, and most libraries treat it as a convenience function.
+
+| Library | Default Behavior | Safe Option |
+|---------|------------------|-------------|
+| Python `zipfile` | Vulnerable | `filter="data"` (opt-in, obscure) |
+| Rust `zip` | Vulnerable | Manual path validation |
+| `safe_unzip` | **Safe by default** | N/A — always safe |
+
+If you're extracting untrusted archives, you need a library designed for that threat model.
+
+## Who Should Use This
+
+- **Backend services** handling user-uploaded zip files
+- **CI/CD systems** unpacking third-party artifacts  
+- **SaaS platforms** with file import features
+- **Forensics / malware analysis** pipelines
+- **Anything running as a privileged user**
+
+If your zip files only come from trusted sources you control, the standard `zip` crate is fine. If users can upload archives, use `safe_unzip`.
+
 ## Features
 
 - **Zip Slip Protection** — Path traversal attacks blocked via [path_jail](https://crates.io/crates/path_jail)
@@ -62,10 +84,27 @@ extract_file("/var/uploads", "evil.zip")
 
 ## Installation
 
+**Rust:**
 ```toml
 [dependencies]
 safe_unzip = "0.1"
 ```
+
+**Python:**
+```bash
+pip install safe-unzip
+```
+
+### Python Bindings
+
+The Python bindings are **thin wrappers** over the Rust implementation via PyO3. This means:
+
+- ✅ **Identical security guarantees** — same code path, same validation
+- ✅ **Identical limits** — same defaults (1GB total, 10K files, 100MB per file)
+- ✅ **Identical semantics** — same error conditions, same behavior
+- ✅ **No re-implementation** — Python calls Rust directly, no logic duplication
+
+Security reviewers: the Python API is a direct binding, not a port.
 
 ## Quick Start
 
