@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "safe-unzip"
-version = "0.1.0"
+version = "0.1.1"
 description = "Secure zip extraction. Prevents Zip Slip and Zip Bombs."
 # readme included from workspace root by maturin
 license = {text = "MIT OR Apache-2.0"}

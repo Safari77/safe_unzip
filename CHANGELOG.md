@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1] - 2025-12-31
+
+### Changed
+
+- Upgraded `path_jail` dependency from 0.1 to 0.2
+- Added ARM64 CI builds (Linux arm64, Windows arm64)
+
+### Fixed
+
+- Fixed PyPI sdist build (README handling)
+
 ## [0.1.0] - 2025-12-31
 
 ### Initial Release 🎉

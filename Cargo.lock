@@ -420,9 +420,9 @@ checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 
 [[package]]
 name = "path_jail"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "992767a405db8057b1560f8403b532f10a8065ba520e529e0d1dfc2c3f36e981"
+checksum = "53740d8f837c89c9978bfbdaa7d48e3dac9f211944bab5f80cb0dcc262bf1edd"
 
 [[package]]
 name = "pbkdf2"
@@ -560,7 +560,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "safe_unzip"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "path_jail",
  "tempfile",
@@ -569,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "safe_unzip_python"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "pyo3",
  "safe_unzip",

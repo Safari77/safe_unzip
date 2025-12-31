@@ -1,6 +1,6 @@
 [package]
 name = "safe_unzip"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tenuo-ai/safe_unzip"
@@ -14,7 +14,7 @@ categories = ["filesystem", "compression"]
 members = [".", "python"]
 
 [dependencies]
-path_jail = "0.1"
+path_jail = "0.2"
 zip = "2.1"
 
 [dev-dependencies]
