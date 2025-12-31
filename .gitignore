@@ -1,1 +1,19 @@
-/target
+# Build artifacts
+/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+.eggs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Generated during build (copied from root)
+python/README.md

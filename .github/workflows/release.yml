@@ -50,7 +50,10 @@ jobs:
       - name: Build wheels
         env:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: 1
-        run: cd python && maturin build --release --strip
+        shell: bash
+        run: |
+          cp README.md python/README.md
+          cd python && maturin build --release --strip
       
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -74,7 +77,9 @@ jobs:
         run: pip install maturin
       
       - name: Build sdist
-        run: cd python && maturin sdist
+        run: |
+          cp README.md python/README.md
+          cd python && maturin sdist
       
       - name: Upload sdist
         uses: actions/upload-artifact@v4
@@ -125,9 +130,18 @@ jobs:
           path: dist
           merge-multiple: true
       
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          # Extract section for this version from CHANGELOG.md
+          awk "/## \[${VERSION}\]/,/## \[/" CHANGELOG.md | head -n -1 > release_notes.md
+          echo "Release notes:"
+          cat release_notes.md
+      
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.whl
-          generate_release_notes: true
+          body_path: release_notes.md
 
