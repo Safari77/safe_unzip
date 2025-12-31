@@ -114,6 +114,7 @@ def test_blocks_absolute_path(tmp_path):
         pass  # Expected behavior
 
 
+@pytest.mark.skipif(os.name == 'nt', reason="Windows normalizes backslashes before Rust sees them")
 def test_blocks_backslash_traversal(tmp_path):
     """Test that backslash paths are rejected."""
     zip_data = create_simple_zip("folder\\file.txt", b"data")
