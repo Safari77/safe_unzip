@@ -14,3 +14,4 @@ crate-type = ["cdylib"]
 [dependencies]
 safe_unzip = { path = ".." }
 pyo3 = { version = "0.24", features = ["extension-module"] }
+flate2 = "1"  # For .tar.gz support

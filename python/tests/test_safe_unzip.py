@@ -5,7 +5,9 @@ guarantees to the Rust implementation.
 """
 
 import io
+import gzip
 import os
+import tarfile
 import zipfile
 from pathlib import Path
 
@@ -15,9 +17,13 @@ from safe_unzip import (
     Extractor,
     extract_file,
     extract_bytes,
+    extract_tar_file,
+    extract_tar_gz_file,
+    extract_tar_bytes,
     PathEscapeError,
     QuotaError,
     AlreadyExistsError,
+    UnsupportedEntryTypeError,
 )
 
 
@@ -307,4 +313,169 @@ def test_rejects_empty_filename(tmp_path):
     
     with pytest.raises(PathEscapeError):
         Extractor(tmp_path).extract_bytes(zip_data)
+
+
+# ============================================================================
+# TAR Extraction Tests
+# ============================================================================
+
+def create_simple_tar(filename: str, content: bytes) -> bytes:
+    """Create a tar file with a single entry."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode='w') as tf:
+        info = tarfile.TarInfo(name=filename)
+        info.size = len(content)
+        tf.addfile(info, io.BytesIO(content))
+    return buffer.getvalue()
+
+
+def create_multi_file_tar(files: dict[str, bytes]) -> bytes:
+    """Create a tar file with multiple entries."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode='w') as tf:
+        for name, content in files.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(content)
+            tf.addfile(info, io.BytesIO(content))
+    return buffer.getvalue()
+
+
+def create_tar_gz(tar_data: bytes) -> bytes:
+    """Compress tar data with gzip."""
+    buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=buffer, mode='wb') as gz:
+        gz.write(tar_data)
+    return buffer.getvalue()
+
+
+def test_tar_extract_simple(tmp_path):
+    """Test basic TAR extraction."""
+    tar_data = create_simple_tar("hello.txt", b"Hello, TAR!")
+    
+    report = Extractor(tmp_path).extract_tar_bytes(tar_data)
+    
+    assert report.files_extracted == 1
+    assert report.bytes_written == 11
+    assert (tmp_path / "hello.txt").read_text() == "Hello, TAR!"
+
+
+def test_tar_extract_multiple_files(tmp_path):
+    """Test extracting multiple files from TAR."""
+    tar_data = create_multi_file_tar({
+        "a.txt": b"aaa",
+        "b.txt": b"bbb",
+        "subdir/c.txt": b"ccc",
+    })
+    
+    report = Extractor(tmp_path).extract_tar_bytes(tar_data)
+    
+    assert report.files_extracted == 3
+    assert (tmp_path / "a.txt").exists()
+    assert (tmp_path / "subdir" / "c.txt").exists()
+
+
+def test_tar_gz_extraction(tmp_path):
+    """Test .tar.gz extraction."""
+    tar_data = create_simple_tar("compressed.txt", b"I was compressed!")
+    gz_data = create_tar_gz(tar_data)
+    
+    report = Extractor(tmp_path).extract_tar_gz_bytes(gz_data)
+    
+    assert report.files_extracted == 1
+    assert (tmp_path / "compressed.txt").read_text() == "I was compressed!"
+
+
+def test_tar_convenience_function(tmp_path):
+    """Test extract_tar_bytes convenience function."""
+    tar_data = create_simple_tar("test.txt", b"test content")
+    
+    report = extract_tar_bytes(tmp_path, tar_data)
+    
+    assert report.files_extracted == 1
+    assert (tmp_path / "test.txt").exists()
+
+
+def test_tar_blocks_path_traversal(tmp_path):
+    """Test that TAR path traversal is blocked."""
+    # Note: Python's tarfile sanitizes paths, but we test anyway
+    tar_data = create_simple_tar("../evil.txt", b"evil")
+    
+    # Should either raise or safely contain
+    try:
+        Extractor(tmp_path).extract_tar_bytes(tar_data)
+        # If it succeeded, ensure nothing was written outside
+        assert not (tmp_path.parent / "evil.txt").exists()
+    except PathEscapeError:
+        pass  # Expected
+
+
+def test_tar_enforces_size_limit(tmp_path):
+    """Test that TAR respects size limits."""
+    tar_data = create_simple_tar("big.txt", b"x" * 1000)
+    
+    with pytest.raises(QuotaError):
+        Extractor(tmp_path).max_total_mb(0).extract_tar_bytes(tar_data)
+
+
+def test_tar_enforces_file_count_limit(tmp_path):
+    """Test that TAR respects file count limits."""
+    tar_data = create_multi_file_tar({
+        "a.txt": b"a",
+        "b.txt": b"b",
+        "c.txt": b"c",
+        "d.txt": b"d",
+        "e.txt": b"e",
+    })
+    
+    with pytest.raises(QuotaError):
+        Extractor(tmp_path).max_files(3).extract_tar_bytes(tar_data)
+
+
+def test_tar_enforces_depth_limit(tmp_path):
+    """Test that TAR respects depth limits."""
+    deep_path = "/".join(["d"] * 100) + "/file.txt"
+    tar_data = create_simple_tar(deep_path, b"deep")
+    
+    with pytest.raises(QuotaError):
+        Extractor(tmp_path).max_depth(10).extract_tar_bytes(tar_data)
+
+
+def test_tar_overwrite_policy_error(tmp_path):
+    """Test that TAR respects overwrite policy 'error'."""
+    (tmp_path / "existing.txt").write_text("original")
+    tar_data = create_simple_tar("existing.txt", b"new")
+    
+    with pytest.raises(AlreadyExistsError):
+        Extractor(tmp_path).overwrite("error").extract_tar_bytes(tar_data)
+    
+    assert (tmp_path / "existing.txt").read_text() == "original"
+
+
+def test_tar_overwrite_policy_skip(tmp_path):
+    """Test that TAR respects overwrite policy 'skip'."""
+    (tmp_path / "existing.txt").write_text("original")
+    tar_data = create_simple_tar("existing.txt", b"new")
+    
+    report = Extractor(tmp_path).overwrite("skip").extract_tar_bytes(tar_data)
+    
+    assert report.entries_skipped == 1
+    assert (tmp_path / "existing.txt").read_text() == "original"
+
+
+def test_tar_validate_first_mode(tmp_path):
+    """Test that TAR validate_first mode works."""
+    # Create tar with valid file then oversized file
+    tar_data = create_multi_file_tar({
+        "good.txt": b"good",
+        "big.txt": b"x" * 10000,
+    })
+    
+    with pytest.raises(QuotaError):
+        (Extractor(tmp_path)
+         .max_single_file_mb(0)
+         .mode("validate_first")
+         .extract_tar_bytes(tar_data))
+    
+    # Nothing should be extracted in validate_first mode
+    assert not (tmp_path / "good.txt").exists()
 

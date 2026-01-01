@@ -29,7 +29,7 @@ class Report:
         ...
 
 class Extractor:
-    """Zip extractor with security constraints."""
+    """Archive extractor with security constraints. Supports ZIP and TAR."""
     
     def __init__(self, destination: _PathType) -> None:
         """Create extractor for the given destination directory."""
@@ -63,20 +63,52 @@ class Extractor:
         """Set extraction mode: 'streaming' or 'validate_first'."""
         ...
     
+    # ZIP extraction
     def extract_file(self, path: _PathType) -> Report:
-        """Extract from a file path."""
+        """Extract a ZIP file."""
         ...
     
     def extract_bytes(self, data: bytes) -> Report:
-        """Extract from bytes."""
+        """Extract ZIP from bytes."""
+        ...
+    
+    # TAR extraction
+    def extract_tar_file(self, path: _PathType) -> Report:
+        """Extract a TAR file."""
+        ...
+    
+    def extract_tar_gz_file(self, path: _PathType) -> Report:
+        """Extract a gzip-compressed TAR file (.tar.gz, .tgz)."""
+        ...
+    
+    def extract_tar_bytes(self, data: bytes) -> Report:
+        """Extract TAR from bytes."""
+        ...
+    
+    def extract_tar_gz_bytes(self, data: bytes) -> Report:
+        """Extract gzip-compressed TAR from bytes."""
         ...
 
+# ZIP convenience functions
 def extract_file(destination: _PathType, path: _PathType) -> Report:
-    """Extract a zip file with default settings."""
+    """Extract a ZIP file with default settings."""
     ...
 
 def extract_bytes(destination: _PathType, data: bytes) -> Report:
-    """Extract from bytes with default settings."""
+    """Extract ZIP from bytes with default settings."""
+    ...
+
+# TAR convenience functions
+def extract_tar_file(destination: _PathType, path: _PathType) -> Report:
+    """Extract a TAR file with default settings."""
+    ...
+
+def extract_tar_gz_file(destination: _PathType, path: _PathType) -> Report:
+    """Extract a gzip-compressed TAR file (.tar.gz, .tgz) with default settings."""
+    ...
+
+def extract_tar_bytes(destination: _PathType, data: bytes) -> Report:
+    """Extract TAR from bytes with default settings."""
     ...
 
 class SafeUnzipError(Exception):

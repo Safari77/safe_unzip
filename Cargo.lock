@@ -605,6 +605,7 @@ dependencies = [
 name = "safe_unzip_python"
 version = "0.1.2"
 dependencies = [
+ "flate2",
  "pyo3",
  "safe_unzip",
 ]

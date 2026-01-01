@@ -127,6 +127,17 @@ impl From<safe_unzip::Report> for PyReport {
     }
 }
 
+impl From<safe_unzip::ExtractionReport> for PyReport {
+    fn from(r: safe_unzip::ExtractionReport) -> Self {
+        PyReport {
+            files_extracted: r.files_extracted,
+            dirs_created: r.dirs_created,
+            bytes_written: r.bytes_written,
+            entries_skipped: r.entries_skipped,
+        }
+    }
+}
+
 // ============================================================================
 // Extractor
 // ============================================================================
@@ -235,6 +246,40 @@ impl PyExtractor {
         let report = extractor.extract(cursor).map_err(to_py_err)?;
         Ok(report.into())
     }
+
+    /// Extract a TAR file.
+    fn extract_tar_file(&self, path: PathBuf) -> PyResult<PyReport> {
+        let driver = self.build_driver()?;
+        let report = driver.extract_tar_file(path).map_err(to_py_err)?;
+        Ok(report.into())
+    }
+
+    /// Extract a gzip-compressed TAR file (.tar.gz, .tgz).
+    fn extract_tar_gz_file(&self, path: PathBuf) -> PyResult<PyReport> {
+        let driver = self.build_driver()?;
+        let report = driver.extract_tar_gz_file(path).map_err(to_py_err)?;
+        Ok(report.into())
+    }
+
+    /// Extract TAR from bytes.
+    fn extract_tar_bytes(&self, data: &[u8]) -> PyResult<PyReport> {
+        let driver = self.build_driver()?;
+        let cursor = std::io::Cursor::new(data.to_vec());
+        let adapter = safe_unzip::TarAdapter::new(cursor);
+        let report = driver.extract_tar(adapter).map_err(to_py_err)?;
+        Ok(report.into())
+    }
+
+    /// Extract gzip-compressed TAR from bytes.
+    fn extract_tar_gz_bytes(&self, data: &[u8]) -> PyResult<PyReport> {
+        use flate2::read::GzDecoder;
+        let driver = self.build_driver()?;
+        let cursor = std::io::Cursor::new(data.to_vec());
+        let decoder = GzDecoder::new(cursor);
+        let adapter = safe_unzip::TarAdapter::new(decoder);
+        let report = driver.extract_tar(adapter).map_err(to_py_err)?;
+        Ok(report.into())
+    }
 }
 
 impl PyExtractor {
@@ -266,6 +311,35 @@ impl PyExtractor {
 
         Ok(extractor)
     }
+
+    fn build_driver(&self) -> PyResult<safe_unzip::Driver> {
+        let mut driver = safe_unzip::Driver::new(&self.destination).map_err(to_py_err)?;
+
+        driver = driver.limits(safe_unzip::Limits {
+            max_total_bytes: self.max_total_bytes,
+            max_file_count: self.max_file_count,
+            max_single_file: self.max_single_file,
+            max_path_depth: self.max_path_depth,
+        });
+
+        driver = match self.overwrite.as_str() {
+            "skip" => driver.overwrite(safe_unzip::OverwriteMode::Skip),
+            "overwrite" => driver.overwrite(safe_unzip::OverwriteMode::Overwrite),
+            _ => driver.overwrite(safe_unzip::OverwriteMode::Error),
+        };
+
+        driver = match self.symlinks.as_str() {
+            "error" => driver.symlinks(safe_unzip::SymlinkBehavior::Error),
+            _ => driver.symlinks(safe_unzip::SymlinkBehavior::Skip),
+        };
+
+        driver = match self.mode.as_str() {
+            "validate_first" => driver.validation(safe_unzip::ValidationMode::ValidateFirst),
+            _ => driver.validation(safe_unzip::ValidationMode::Streaming),
+        };
+
+        Ok(driver)
+    }
 }
 
 // ============================================================================
@@ -288,6 +362,32 @@ fn extract_bytes(destination: PathBuf, data: &[u8]) -> PyResult<PyReport> {
     Ok(report.into())
 }
 
+/// Extract a TAR file with default settings.
+#[pyfunction]
+fn extract_tar_file(destination: PathBuf, path: PathBuf) -> PyResult<PyReport> {
+    let driver = safe_unzip::Driver::new_or_create(&destination).map_err(to_py_err)?;
+    let report = driver.extract_tar_file(path).map_err(to_py_err)?;
+    Ok(report.into())
+}
+
+/// Extract a gzip-compressed TAR file (.tar.gz, .tgz) with default settings.
+#[pyfunction]
+fn extract_tar_gz_file(destination: PathBuf, path: PathBuf) -> PyResult<PyReport> {
+    let driver = safe_unzip::Driver::new_or_create(&destination).map_err(to_py_err)?;
+    let report = driver.extract_tar_gz_file(path).map_err(to_py_err)?;
+    Ok(report.into())
+}
+
+/// Extract TAR from bytes with default settings.
+#[pyfunction]
+fn extract_tar_bytes(destination: PathBuf, data: &[u8]) -> PyResult<PyReport> {
+    let driver = safe_unzip::Driver::new_or_create(&destination).map_err(to_py_err)?;
+    let cursor = std::io::Cursor::new(data.to_vec());
+    let adapter = safe_unzip::TarAdapter::new(cursor);
+    let report = driver.extract_tar(adapter).map_err(to_py_err)?;
+    Ok(report.into())
+}
+
 // ============================================================================
 // Module
 // ============================================================================
@@ -298,9 +398,14 @@ fn _safe_unzip(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyExtractor>()?;
     m.add_class::<PyReport>()?;
 
-    // Functions
+    // Functions - ZIP
     m.add_function(wrap_pyfunction!(extract_file, m)?)?;
     m.add_function(wrap_pyfunction!(extract_bytes, m)?)?;
+
+    // Functions - TAR
+    m.add_function(wrap_pyfunction!(extract_tar_file, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_tar_gz_file, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_tar_bytes, m)?)?;
 
     // Exceptions
     m.add("SafeUnzipError", py.get_type::<SafeUnzipError>())?;
