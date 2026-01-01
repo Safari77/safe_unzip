@@ -1,6 +1,6 @@
 # safe_unzip
 
-Zip extraction that won't ruin your day.
+Archive extraction that won't ruin your day. Supports **ZIP** and **TAR** formats.
 
 ## The Problem
 
@@ -47,14 +47,16 @@ extract_file("/var/uploads", "evil.zip")
 
 **Security is the default.** No special flags, no opt-in safety. Every path is validated. Malicious archives are rejected, not extracted.
 
-## Why Not Just Use `zip` / `zipfile`?
+## Why Not Just Use `zip` / `tar` / `zipfile`?
 
 Because **archive extraction is a security boundary**, and most libraries treat it as a convenience function.
 
 | Library | Default Behavior | Safe Option |
 |---------|------------------|-------------|
 | Python `zipfile` | Vulnerable | `filter="data"` (opt-in, obscure) |
+| Python `tarfile` | Vulnerable | `filter="data"` (opt-in, Python 3.12+) |
 | Rust `zip` | Vulnerable | Manual path validation |
+| Rust `tar` | Vulnerable | Manual path validation |
 | `safe_unzip` | **Safe by default** | N/A — always safe |
 
 If you're extracting untrusted archives, you need a library designed for that threat model.
@@ -71,12 +73,14 @@ If your zip files only come from trusted sources you control, the standard `zip`
 
 ## Features
 
+- **Multi-Format Support** — ZIP and TAR (`.tar`, `.tar.gz`) archives
 - **Zip Slip Protection** — Path traversal attacks blocked via [path_jail](https://crates.io/crates/path_jail)
 - **Zip Bomb Protection** — Configurable limits on size, file count, and path depth
 - **Strict Size Enforcement** — Catches files that decompress larger than declared
 - **Filename Sanitization** — Blocks control characters and Windows reserved names
 - **Symlink Handling** — Skip or reject symlinks (no symlink-based escapes)
 - **Secure Overwrite** — Removes symlinks before overwriting to prevent symlink attacks
+- **Atomic File Creation** — TOCTOU-safe file creation using `O_EXCL`
 - **Overwrite Policies** — Error, skip, or overwrite existing files
 - **Filter Callback** — Extract only the files you want
 - **Two-Pass Mode** — Validate everything before writing anything
@@ -252,6 +256,28 @@ let report = Extractor::new("/var/uploads")?
     .extract(cursor)?;
 ```
 
+### TAR Extraction (New in v0.1.2)
+
+```rust
+use safe_unzip::{Driver, TarAdapter};
+
+// Extract a .tar file
+let report = Driver::new("/var/uploads")?
+    .extract_tar_file("archive.tar")?;
+
+// Extract a .tar.gz file
+let report = Driver::new("/var/uploads")?
+    .extract_tar_gz_file("archive.tar.gz")?;
+
+// With options
+let report = Driver::new("/var/uploads")?
+    .filter(|entry| entry.name.ends_with(".txt"))
+    .validation(safe_unzip::ValidationMode::ValidateFirst)
+    .extract_tar_file("archive.tar")?;
+```
+
+The new `Driver` API provides a unified interface for all archive formats with the same security guarantees.
+
 ## Security Model
 
 | Threat | Attack Vector | Defense |
@@ -317,8 +343,9 @@ match extract_file("/var/uploads", "archive.zip") {
 
 ### Format Limitations
 
-- **Zip format only** — Tar/gzip support planned for v0.2
-- **Requires seekable input** — No stdin streaming (zip format requires reading the central directory at the end of the file)
+- **ZIP and TAR only** — Other formats (7z, rar) not supported
+- **Requires seekable input for ZIP** — ZIP format requires reading the central directory at the end
+- **TAR is sequential** — TAR files are read in order; `ValidateFirst` mode caches entries in memory
 - **No encrypted archives** — See below
 
 ### Encrypted Archives

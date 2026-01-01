@@ -1,6 +1,12 @@
 use std::fmt;
 
+/// Errors that can occur during archive extraction.
+///
+/// This enum is marked `#[non_exhaustive]` to allow adding new variants
+/// in minor versions without breaking existing code. Always include a
+/// catch-all `_ =>` arm when matching.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// Path escapes destination directory (Zip Slip).
     PathEscape { entry: String, detail: String },

@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 
-use crate::adapter::ZipAdapter;
+use crate::adapter::{TarAdapter, ZipAdapter};
 use crate::entry::{EntryInfo, EntryKind};
 use crate::error::Error;
 use crate::limits::Limits;
@@ -323,9 +323,262 @@ impl Driver {
         Ok(())
     }
 
-    /// Convenience: extract from a file path.
+    /// Convenience: extract ZIP from a file path.
     pub fn extract_zip_file<P: AsRef<Path>>(&self, path: P) -> Result<ExtractionReport, Error> {
         let adapter = ZipAdapter::open(path)?;
         self.extract_zip(adapter)
+    }
+
+    // =========================================================================
+    // TAR Extraction
+    // =========================================================================
+
+    /// Extract a TAR archive.
+    ///
+    /// For `.tar.gz` files, use [`Self::extract_tar_gz`] or wrap the reader
+    /// in `flate2::read::GzDecoder`.
+    pub fn extract_tar<R: Read>(
+        &self,
+        mut adapter: TarAdapter<R>,
+    ) -> Result<ExtractionReport, Error> {
+        let policies = self.build_policies()?;
+
+        // ValidateFirst mode: cache all entries, validate, then extract
+        if self.validation == ValidationMode::ValidateFirst {
+            let entries = adapter.cache_all()?;
+            let mut state = ExtractionState::default();
+
+            // Validate all entries
+            for info in &entries {
+                policies.check_all(info, &state)?;
+                if matches!(info.kind, EntryKind::File) {
+                    state.bytes_written += info.size;
+                    state.files_extracted += 1;
+                }
+            }
+
+            // Extract from cache
+            let mut state = ExtractionState::default();
+            adapter.extract_cached(|info, data| {
+                self.extract_tar_entry_data(&info, data, &policies, &mut state)?;
+                Ok(true)
+            })?;
+
+            return Ok(ExtractionReport {
+                files_extracted: state.files_extracted,
+                dirs_created: state.dirs_created,
+                bytes_written: state.bytes_written,
+                entries_skipped: state.entries_skipped,
+            });
+        }
+
+        // Streaming mode: extract as we read
+        let mut state = ExtractionState::default();
+
+        adapter.for_each(|info, reader| {
+            self.extract_tar_entry(&info, reader, &policies, &mut state)?;
+            Ok(true)
+        })?;
+
+        Ok(ExtractionReport {
+            files_extracted: state.files_extracted,
+            dirs_created: state.dirs_created,
+            bytes_written: state.bytes_written,
+            entries_skipped: state.entries_skipped,
+        })
+    }
+
+    /// Extract a single TAR entry (streaming mode).
+    fn extract_tar_entry(
+        &self,
+        info: &EntryInfo,
+        reader: Option<&mut dyn Read>,
+        policies: &PolicyChain,
+        state: &mut ExtractionState,
+    ) -> Result<(), Error> {
+        // Apply filter
+        if let Some(ref filter) = self.filter {
+            if !filter(info) {
+                state.entries_skipped += 1;
+                return Ok(());
+            }
+        }
+
+        // Check policies
+        policies.check_all(info, state)?;
+
+        // Handle symlinks
+        if matches!(info.kind, EntryKind::Symlink { .. }) {
+            state.entries_skipped += 1;
+            return Ok(());
+        }
+
+        let safe_path = self.destination.join(&info.name);
+
+        match info.kind {
+            EntryKind::Directory => {
+                fs::create_dir_all(&safe_path)?;
+                state.dirs_created += 1;
+            }
+            EntryKind::File => {
+                if let Some(parent) = safe_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+
+                let outfile = self.open_for_write(&safe_path, state)?;
+                let Some(mut outfile) = outfile else {
+                    return Ok(()); // Skipped
+                };
+
+                if let Some(reader) = reader {
+                    let limit = self.limits.max_single_file.min(
+                        self.limits
+                            .max_total_bytes
+                            .saturating_sub(state.bytes_written),
+                    );
+                    let written = crate::adapter::copy_limited(reader, &mut outfile, limit)?;
+                    state.bytes_written += written;
+                }
+
+                #[cfg(unix)]
+                if let Some(mode) = info.mode {
+                    use std::os::unix::fs::PermissionsExt;
+                    let safe_mode = mode & 0o0777;
+                    fs::set_permissions(&safe_path, fs::Permissions::from_mode(safe_mode))?;
+                }
+
+                state.files_extracted += 1;
+            }
+            EntryKind::Symlink { .. } => {
+                // Already handled
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Extract a single TAR entry from cached data (ValidateFirst mode).
+    fn extract_tar_entry_data(
+        &self,
+        info: &EntryInfo,
+        data: Option<&[u8]>,
+        policies: &PolicyChain,
+        state: &mut ExtractionState,
+    ) -> Result<(), Error> {
+        // Apply filter
+        if let Some(ref filter) = self.filter {
+            if !filter(info) {
+                state.entries_skipped += 1;
+                return Ok(());
+            }
+        }
+
+        // Check policies (already validated, but need for state updates)
+        policies.check_all(info, state)?;
+
+        // Handle symlinks
+        if matches!(info.kind, EntryKind::Symlink { .. }) {
+            state.entries_skipped += 1;
+            return Ok(());
+        }
+
+        let safe_path = self.destination.join(&info.name);
+
+        match info.kind {
+            EntryKind::Directory => {
+                fs::create_dir_all(&safe_path)?;
+                state.dirs_created += 1;
+            }
+            EntryKind::File => {
+                if let Some(parent) = safe_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+
+                let outfile = self.open_for_write(&safe_path, state)?;
+                let Some(mut outfile) = outfile else {
+                    return Ok(()); // Skipped
+                };
+
+                if let Some(data) = data {
+                    use std::io::Write;
+                    outfile.write_all(data)?;
+                    state.bytes_written += data.len() as u64;
+                }
+
+                #[cfg(unix)]
+                if let Some(mode) = info.mode {
+                    use std::os::unix::fs::PermissionsExt;
+                    let safe_mode = mode & 0o0777;
+                    fs::set_permissions(&safe_path, fs::Permissions::from_mode(safe_mode))?;
+                }
+
+                state.files_extracted += 1;
+            }
+            EntryKind::Symlink { .. } => {
+                // Already handled
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Open a file for writing based on overwrite policy.
+    /// Returns None if the file should be skipped.
+    fn open_for_write(
+        &self,
+        path: &Path,
+        state: &mut ExtractionState,
+    ) -> Result<Option<fs::File>, Error> {
+        match self.overwrite {
+            OverwriteMode::Error => {
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                {
+                    Ok(f) => Ok(Some(f)),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        Err(Error::AlreadyExists {
+                            path: path.display().to_string(),
+                        })
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            }
+            OverwriteMode::Skip => {
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                {
+                    Ok(f) => Ok(Some(f)),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        state.entries_skipped += 1;
+                        Ok(None)
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            }
+            OverwriteMode::Overwrite => {
+                if let Ok(m) = fs::symlink_metadata(path) {
+                    if m.file_type().is_symlink() {
+                        let _ = fs::remove_file(path);
+                    }
+                }
+                Ok(Some(fs::File::create(path)?))
+            }
+        }
+    }
+
+    /// Convenience: extract TAR from a file path.
+    pub fn extract_tar_file<P: AsRef<Path>>(&self, path: P) -> Result<ExtractionReport, Error> {
+        let adapter = TarAdapter::open(path)?;
+        self.extract_tar(adapter)
+    }
+
+    /// Convenience: extract gzip-compressed TAR (.tar.gz, .tgz) from a file path.
+    pub fn extract_tar_gz_file<P: AsRef<Path>>(&self, path: P) -> Result<ExtractionReport, Error> {
+        let adapter = TarAdapter::open_gz(path)?;
+        self.extract_tar(adapter)
     }
 }

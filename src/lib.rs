@@ -13,7 +13,7 @@ pub use extractor::{EntryInfo, ExtractionMode, Extractor, OverwritePolicy, Repor
 pub use limits::Limits;
 
 // Re-export new types
-pub use adapter::ZipAdapter;
+pub use adapter::{TarAdapter, ZipAdapter};
 pub use driver::{Driver, ExtractionReport, OverwriteMode, ValidationMode};
 pub use entry::{Entry, EntryKind};
 pub use policy::{Policy, PolicyChain, PolicyConfig, SymlinkBehavior};
