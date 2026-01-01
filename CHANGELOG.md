@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2] - 2025-12-31
+
+### Added
+
+- **TAR Support**: Extract `.tar` and `.tar.gz` archives with the same security guarantees
+  - `Driver::extract_tar()`, `extract_tar_file()`, `extract_tar_gz_file()`
+  - `TarAdapter` for the new architecture
+- **New Architecture**: Modular design with Adapters, Policies, and Driver
+  - `Driver` - generic extraction engine
+  - `ZipAdapter`, `TarAdapter` - format-specific handlers
+  - `Policy` trait with `PathPolicy`, `SizePolicy`, `CountPolicy`, `DepthPolicy`, `SymlinkPolicy`
+  - `PolicyChain` for composing multiple policies
+- **Encryption Detection**: Error on encrypted ZIP entries with clear message
+- **Atomic File Creation**: Uses `create_new(true)` for `OverwriteMode::Error/Skip` to prevent TOCTOU races
+- **Device File Rejection**: TAR entries with block devices, char devices, or FIFOs now error with `UnsupportedEntryType`
+- **Fuzzing Setup**: `cargo-fuzz` with `fuzz_extract` and `fuzz_zip_adapter` targets
+- **12 New TAR Security Tests**: Block/char devices, FIFOs, absolute paths, symlinks, setuid stripping, limits
+
+### Changed
+
+- **Improved Error Messages**:
+  - `SymlinkNotAllowed` now shows target path (e.g., `'link' -> '/etc/passwd'`)
+  - `FileCountExceeded` clarifies stopping point
+  - `AlreadyExists` uses `entry` field for consistency
+- **`#[non_exhaustive]` on `Error` enum**: Future error variants won't break exhaustive matches
+
+### Python Bindings
+
+- Added `UnsupportedEntryTypeError` exception
+- Updated error messages to match Rust improvements
+
 ## [0.1.1] - 2025-12-31
 
 ### Changed
