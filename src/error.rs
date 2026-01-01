@@ -1,12 +1,18 @@
 use std::fmt;
 
+/// Errors that can occur during archive extraction.
+///
+/// This enum is marked `#[non_exhaustive]` to allow adding new variants
+/// in minor versions without breaking existing code. Always include a
+/// catch-all `_ =>` arm when matching.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// Path escapes destination directory (Zip Slip).
     PathEscape { entry: String, detail: String },
 
     /// Archive contains symlink and policy is Error.
-    SymlinkNotAllowed { entry: String },
+    SymlinkNotAllowed { entry: String, target: String },
 
     /// Exceeded maximum total bytes.
     TotalSizeExceeded { limit: u64, would_be: u64 },
@@ -36,7 +42,7 @@ pub enum Error {
     },
 
     /// File already exists and policy is Error.
-    AlreadyExists { path: String },
+    AlreadyExists { entry: String },
 
     /// Destination directory does not exist or is invalid.
     DestinationNotFound { path: String },
@@ -44,10 +50,16 @@ pub enum Error {
     /// Filename contains invalid characters or reserved names.
     InvalidFilename { entry: String, reason: String },
 
+    /// Archive entry is encrypted (not supported).
+    EncryptedEntry { entry: String },
+
+    /// Archive contains unsupported entry type (device file, fifo, etc.).
+    UnsupportedEntryType { entry: String, entry_type: String },
+
     /// Zip format error.
     Zip(zip::result::ZipError),
 
-    /// IO error.
+    /// IO error (includes TAR format errors since tar crate uses io::Error).
     Io(std::io::Error),
 
     /// Path jail error.
@@ -77,12 +89,20 @@ impl fmt::Display for Error {
             Self::PathEscape { entry, detail } => {
                 write!(f, "path '{}' escapes destination: {}", entry, detail)
             }
-            Self::SymlinkNotAllowed { entry } => {
-                write!(
-                    f,
-                    "archive contains symlink '{}' (symlinks not allowed)",
-                    entry
-                )
+            Self::SymlinkNotAllowed { entry, target } => {
+                if target.is_empty() {
+                    write!(
+                        f,
+                        "archive contains symlink '{}' (symlinks not allowed)",
+                        entry
+                    )
+                } else {
+                    write!(
+                        f,
+                        "archive contains symlink '{}' -> '{}' (symlinks not allowed)",
+                        entry, target
+                    )
+                }
             }
             Self::TotalSizeExceeded { limit, would_be } => {
                 write!(
@@ -95,7 +115,7 @@ impl fmt::Display for Error {
             Self::FileCountExceeded { limit, attempted } => {
                 write!(
                     f,
-                    "archive contains {} files, exceeding the {} file limit",
+                    "extraction stopped at entry {}: would exceed {} file limit",
                     attempted, limit
                 )
             }
@@ -132,14 +152,28 @@ impl fmt::Display for Error {
                     entry, depth, limit
                 )
             }
-            Self::AlreadyExists { path } => {
-                write!(f, "file '{}' already exists", path)
+            Self::AlreadyExists { entry } => {
+                write!(f, "file '{}' already exists", entry)
             }
             Self::DestinationNotFound { path } => {
                 write!(f, "destination directory '{}' does not exist", path)
             }
             Self::InvalidFilename { entry, reason } => {
                 write!(f, "invalid filename '{}': {}", entry, reason)
+            }
+            Self::EncryptedEntry { entry } => {
+                write!(
+                    f,
+                    "entry '{}' is encrypted (encrypted archives not supported)",
+                    entry
+                )
+            }
+            Self::UnsupportedEntryType { entry, entry_type } => {
+                write!(
+                    f,
+                    "entry '{}' has unsupported type '{}' (device files, fifos, etc. are not allowed)",
+                    entry, entry_type
+                )
             }
             Self::Zip(e) => write!(f, "zip format error: {}", e),
             Self::Io(e) => write!(f, "I/O error: {}", e),

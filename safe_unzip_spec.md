@@ -1,10 +1,10 @@
-# safe_unzip Specification (v0.1)
+# safe_unzip Specification (v0.1.2)
 
-Zip extraction that won't ruin your day.
+Archive extraction that won't ruin your day.
 
 ## 1. Overview
 
-`safe_unzip` is a secure zip extraction library that prevents:
+`safe_unzip` is a secure archive extraction library that prevents:
 
 - **Zip Slip**: Path traversal via `../../` in entry names
 - **Zip Bombs**: Archives that expand to exhaust disk/memory
@@ -30,36 +30,38 @@ Built on `path_jail` for path validation.
 
 ## 3. Scope
 
-### v0.1 (This Spec)
+### v0.1.2 (This Spec)
 
-- Zip format only
+- **ZIP format** — Full support
+- **TAR format** — Plain `.tar` and gzip-compressed `.tar.gz`
 - Synchronous API
 - File and directory extraction
 - Configurable limits
 - Filter callback
+- New adapter/policy/driver architecture for extensibility
 
 ### v0.2 (Planned)
 
-- Tar/tar.gz/tar.bz2 support
 - Async API
 - Atomic extraction (temp dir, move on success)
 - Progress callback
+- More compression formats (bzip2, xz)
 
 ### Non-Goals
 
 - Creating archives (extraction only)
-- Password-protected zips (use `zip` crate directly)
+- Encrypted archives (use `zip` crate directly for decryption first)
 - Self-extracting archives
 
 ## 4. Dependencies
 
 ```toml
 [dependencies]
-path_jail = "0.1"
+path_jail = "0.2"
 zip = "2.1"
+tar = "0.4"
+flate2 = "1"  # For .tar.gz support
 ```
-
-Zero additional dependencies beyond these.
 
 ## 5. Rust API
 
@@ -265,10 +267,70 @@ where
 - Convenience API: "just works" for quick scripts
 - Builder API: explicit control for production code where typos should fail
 
-### 5.4 Error Type
+### 5.4 New Architecture (v0.1.2)
+
+The v0.2 architecture separates concerns for multi-format support:
 
 ```rust
+// Adapters normalize archive formats
+pub struct ZipAdapter<R: Read + Seek> { ... }
+pub struct TarAdapter<R: Read> { ... }
+
+// Generic entry representation
+pub struct EntryInfo {
+    pub name: String,
+    pub size: u64,
+    pub kind: EntryKind,
+    pub mode: Option<u32>,
+}
+
+pub enum EntryKind {
+    File,
+    Directory,
+    Symlink { target: String },
+}
+
+// Driver orchestrates extraction
+pub struct Driver {
+    destination: PathBuf,
+    limits: Limits,
+    overwrite: OverwriteMode,
+    symlinks: SymlinkBehavior,
+    validation: ValidationMode,
+    filter: Option<Box<dyn Fn(&EntryInfo) -> bool + Send + Sync>>,
+}
+
+impl Driver {
+    pub fn new<P: AsRef<Path>>(destination: P) -> Result<Self, Error>;
+    pub fn new_or_create<P: AsRef<Path>>(destination: P) -> Result<Self, Error>;
+    
+    // Builder methods
+    pub fn limits(self, limits: Limits) -> Self;
+    pub fn overwrite(self, mode: OverwriteMode) -> Self;
+    pub fn symlinks(self, behavior: SymlinkBehavior) -> Self;
+    pub fn validation(self, mode: ValidationMode) -> Self;
+    pub fn filter<F>(self, f: F) -> Self;
+    
+    // Extraction methods
+    pub fn extract_zip<R: Read + Seek>(&self, adapter: ZipAdapter<R>) -> Result<ExtractionReport, Error>;
+    pub fn extract_tar<R: Read>(&self, adapter: TarAdapter<R>) -> Result<ExtractionReport, Error>;
+    pub fn extract_zip_file<P: AsRef<Path>>(&self, path: P) -> Result<ExtractionReport, Error>;
+    pub fn extract_tar_file<P: AsRef<Path>>(&self, path: P) -> Result<ExtractionReport, Error>;
+    pub fn extract_tar_gz_file<P: AsRef<Path>>(&self, path: P) -> Result<ExtractionReport, Error>;
+}
+```
+
+The legacy `Extractor` API remains for backward compatibility (ZIP-only).
+
+### 5.5 Error Type
+
+```rust
+/// Errors that can occur during archive extraction.
+/// 
+/// This enum is marked `#[non_exhaustive]` to allow adding new variants
+/// without breaking existing code. Always include a `_ =>` catch-all.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// Path escapes destination directory.
     PathEscape {
@@ -325,6 +387,11 @@ pub enum Error {
         reason: String,
     },
     
+    /// Archive entry is encrypted (not supported).
+    EncryptedEntry {
+        entry: String,
+    },
+    
     /// Destination directory does not exist.
     DestinationNotFound {
         path: String,
@@ -332,6 +399,9 @@ pub enum Error {
     
     /// Zip format error.
     Zip(zip::result::ZipError),
+    
+    /// Tar format error.
+    Tar(std::io::Error),
     
     /// IO error.
     Io(std::io::Error),
@@ -371,10 +441,14 @@ impl std::fmt::Display for Error {
             Self::InvalidFilename { entry, reason } => {
                 write!(f, "invalid filename '{}': {}", entry, reason)
             }
+            Self::EncryptedEntry { entry } => {
+                write!(f, "entry '{}' is encrypted (not supported)", entry)
+            }
             Self::DestinationNotFound { path } => {
                 write!(f, "destination directory '{}' does not exist", path)
             }
             Self::Zip(e) => write!(f, "zip format error: {}", e),
+            Self::Tar(e) => write!(f, "tar format error: {}", e),
             Self::Io(e) => write!(f, "I/O error: {}", e),
             Self::Jail(e) => write!(f, "path validation error: {}", e),
         }
@@ -510,6 +584,27 @@ Reject filenames with:
 - Path > 1024 bytes or component > 255 bytes
 - Windows reserved names: `CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`
 
+### 6.11 Atomic File Creation (TOCTOU Mitigation)
+
+For `OverwriteMode::Error` and `OverwriteMode::Skip`, use `O_CREAT | O_EXCL` (atomic):
+
+```rust
+fs::OpenOptions::new()
+    .write(true)
+    .create_new(true)  // Fails atomically if file exists
+    .open(&path)
+```
+
+This eliminates the race condition between checking if a file exists and creating it.
+
+For `OverwriteMode::Overwrite`, symlinks are removed before writing to prevent symlink-following attacks.
+
+### 6.12 Encrypted Archive Handling
+
+Encrypted entries are rejected with `Error::EncryptedEntry`. This is intentional:
+- Password handling adds complexity and attack surface
+- Users should decrypt with the `zip` crate first, then extract with `safe_unzip`
+
 ## 7. Python API
 
 ### 7.1 Module Structure
@@ -620,9 +715,16 @@ safe_unzip/
 ├── Cargo.toml                    # Workspace root + core library
 ├── src/
 │   ├── lib.rs                    # Public API
-│   ├── extractor.rs              # Core extraction logic
+│   ├── extractor.rs              # Legacy ZIP-only API
+│   ├── driver.rs                 # New generic extraction driver
 │   ├── limits.rs                 # Resource limits
-│   └── error.rs                  # Error types
+│   ├── error.rs                  # Error types
+│   ├── entry.rs                  # Generic entry types
+│   ├── policy.rs                 # Security policies
+│   └── adapter/
+│       ├── mod.rs
+│       ├── zip_adapter.rs        # ZIP format adapter
+│       └── tar_adapter.rs        # TAR format adapter
 ├── python/                       # Python bindings
 │   ├── Cargo.toml
 │   ├── pyproject.toml
@@ -633,8 +735,15 @@ safe_unzip/
 │           ├── __init__.py
 │           ├── __init__.pyi      # Type stubs
 │           └── py.typed          # PEP 561 marker
+├── fuzz/                         # Fuzzing targets
+│   ├── Cargo.toml
+│   └── fuzz_targets/
+│       ├── fuzz_extract.rs
+│       └── fuzz_zip_adapter.rs
 ├── tests/
-│   └── security_test.rs          # Integration tests
+│   ├── security_test.rs          # ZIP security tests
+│   ├── driver_test.rs            # Driver API tests
+│   └── tar_test.rs               # TAR tests
 ├── README.md
 ├── LICENSE-MIT
 └── LICENSE-APACHE
@@ -643,9 +752,10 @@ safe_unzip/
 ### 8.2 Key Configuration
 
 - **Root `Cargo.toml`**: Workspace with `members = [".", "python"]`
-- **Dependencies**: `path_jail = "0.1"`, `zip = "2.1"`
-- **Python bindings**: PyO3 0.22, maturin build system
+- **Dependencies**: `path_jail = "0.2"`, `zip = "2.1"`, `tar = "0.4"`, `flate2 = "1"`
+- **Python bindings**: PyO3 0.24, maturin build system
 - **Package name**: `safe-unzip` on PyPI, `safe_unzip` on crates.io
+- **Fuzzing**: cargo-fuzz with libfuzzer
 
 ## 9. Test Strategy
 
@@ -667,7 +777,7 @@ tests/fixtures/
 
 ### 9.2 Required Test Coverage
 
-**Rust tests must verify:**
+**Rust tests must verify (ZIP):**
 - Path traversal blocked (`PathEscape` error)
 - Symlink escape blocked (skip or `SymlinkNotAllowed`)
 - Size limits enforced (`TotalSizeExceeded`, `FileTooLarge`)
@@ -678,8 +788,17 @@ tests/fixtures/
 - ValidateFirst prevents partial state
 - Setuid bits stripped (Unix only)
 - Size mismatch detected (`SizeMismatch`)
+- Encrypted entries rejected (`EncryptedEntry`)
+- Atomic file creation (TOCTOU)
+
+**Rust tests must verify (TAR):**
+- Basic extraction (.tar)
+- Gzip extraction (.tar.gz)
+- Path traversal blocked
+- ValidateFirst mode
+- Filter callback works
 
 **Python tests must verify:**
 - Same security guarantees as Rust
-- Exception hierarchy works (`PathEscapeError`, `QuotaError`, etc.)
+- Exception hierarchy works (`PathEscapeError`, `QuotaError`, `EncryptedArchiveError`, etc.)
 - Builder API works with string policies

@@ -2,9 +2,21 @@ mod error;
 mod extractor;
 mod limits;
 
+// New architecture modules (v0.2)
+pub mod adapter;
+mod driver;
+pub mod entry;
+pub mod policy;
+
 pub use error::Error;
 pub use extractor::{EntryInfo, ExtractionMode, Extractor, OverwritePolicy, Report, SymlinkPolicy};
 pub use limits::Limits;
+
+// Re-export new types
+pub use adapter::{TarAdapter, ZipAdapter};
+pub use driver::{Driver, ExtractionReport, OverwriteMode, ValidationMode};
+pub use entry::{Entry, EntryKind};
+pub use policy::{Policy, PolicyChain, PolicyConfig, SymlinkBehavior};
 
 /// Extract from a reader with default settings.
 ///

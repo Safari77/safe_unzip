@@ -1,6 +1,6 @@
 # safe_unzip
 
-Zip extraction that won't ruin your day.
+Archive extraction that won't ruin your day. Supports **ZIP** and **TAR** formats.
 
 ## The Problem
 
@@ -47,14 +47,16 @@ extract_file("/var/uploads", "evil.zip")
 
 **Security is the default.** No special flags, no opt-in safety. Every path is validated. Malicious archives are rejected, not extracted.
 
-## Why Not Just Use `zip` / `zipfile`?
+## Why Not Just Use `zip` / `tar` / `zipfile`?
 
 Because **archive extraction is a security boundary**, and most libraries treat it as a convenience function.
 
 | Library | Default Behavior | Safe Option |
 |---------|------------------|-------------|
 | Python `zipfile` | Vulnerable | `filter="data"` (opt-in, obscure) |
+| Python `tarfile` | Vulnerable | `filter="data"` (opt-in, Python 3.12+) |
 | Rust `zip` | Vulnerable | Manual path validation |
+| Rust `tar` | Vulnerable | Manual path validation |
 | `safe_unzip` | **Safe by default** | N/A — always safe |
 
 If you're extracting untrusted archives, you need a library designed for that threat model.
@@ -71,12 +73,14 @@ If your zip files only come from trusted sources you control, the standard `zip`
 
 ## Features
 
+- **Multi-Format Support** — ZIP and TAR (`.tar`, `.tar.gz`) archives
 - **Zip Slip Protection** — Path traversal attacks blocked via [path_jail](https://crates.io/crates/path_jail)
 - **Zip Bomb Protection** — Configurable limits on size, file count, and path depth
 - **Strict Size Enforcement** — Catches files that decompress larger than declared
 - **Filename Sanitization** — Blocks control characters and Windows reserved names
 - **Symlink Handling** — Skip or reject symlinks (no symlink-based escapes)
 - **Secure Overwrite** — Removes symlinks before overwriting to prevent symlink attacks
+- **Atomic File Creation** — TOCTOU-safe file creation using `O_EXCL`
 - **Overwrite Policies** — Error, skip, or overwrite existing files
 - **Filter Callback** — Extract only the files you want
 - **Two-Pass Mode** — Validate everything before writing anything
@@ -252,6 +256,28 @@ let report = Extractor::new("/var/uploads")?
     .extract(cursor)?;
 ```
 
+### TAR Extraction (New in v0.1.2)
+
+```rust
+use safe_unzip::{Driver, TarAdapter};
+
+// Extract a .tar file
+let report = Driver::new("/var/uploads")?
+    .extract_tar_file("archive.tar")?;
+
+// Extract a .tar.gz file
+let report = Driver::new("/var/uploads")?
+    .extract_tar_gz_file("archive.tar.gz")?;
+
+// With options
+let report = Driver::new("/var/uploads")?
+    .filter(|entry| entry.name.ends_with(".txt"))
+    .validation(safe_unzip::ValidationMode::ValidateFirst)
+    .extract_tar_file("archive.tar")?;
+```
+
+The new `Driver` API provides a unified interface for all archive formats with the same security guarantees.
+
 ## Security Model
 
 | Threat | Attack Vector | Defense |
@@ -266,6 +292,7 @@ let report = Extractor::new("/var/uploads")?
 | **Invalid Filename** | Control chars, `CON`, `NUL` | Filename sanitization |
 | **Overwrite** | Replace sensitive files | `OverwritePolicy::Error` default |
 | **Setuid** | Create setuid executables | Permission bits stripped |
+| **Encrypted Archives** | Password handling complexity | Rejected (see [Encrypted Archives](#encrypted-archives)) |
 
 ## Default Limits
 
@@ -300,8 +327,11 @@ match extract_file("/var/uploads", "archive.zip") {
     Err(Error::AlreadyExists { path }) => {
         eprintln!("File already exists: {}", path);
     }
-    Err(Error::InvalidFilename { entry }) => {
+    Err(Error::InvalidFilename { entry, .. }) => {
         eprintln!("Invalid filename: {}", entry);
+    }
+    Err(Error::EncryptedEntry { entry }) => {
+        eprintln!("Encrypted entry not supported: {}", entry);
     }
     Err(e) => {
         eprintln!("Extraction failed: {}", e);
@@ -313,9 +343,20 @@ match extract_file("/var/uploads", "archive.zip") {
 
 ### Format Limitations
 
-- **Zip format only** — Tar/gzip support planned for v0.2
-- **Requires seekable input** — No stdin streaming (zip format requires reading the central directory at the end of the file)
-- **No password-protected zips** — Use the `zip` crate directly for encrypted archives
+- **ZIP and TAR only** — Other formats (7z, rar) not supported
+- **Requires seekable input for ZIP** — ZIP format requires reading the central directory at the end
+- **TAR is sequential** — TAR files are read in order; `ValidateFirst` mode caches entries in memory
+- **No encrypted archives** — See below
+
+### Encrypted Archives
+
+`safe_unzip` does not support password-protected zip files. Encrypted entries are rejected with `Error::EncryptedEntry`.
+
+If you need to extract encrypted archives:
+1. Decrypt first using the `zip` crate directly
+2. Then extract with `safe_unzip`
+
+This is intentional—encryption handling is outside our security scope. Password management, key derivation, and cryptographic validation are complex domains that deserve dedicated tooling.
 
 ### Extraction Behavior
 
@@ -330,10 +371,16 @@ These threats are **not fully addressed** (by design or complexity):
 |------------|--------|
 | **Case-insensitive collisions** | On Windows/macOS, `File.txt` and `file.txt` map to the same file. We don't track extracted names to detect this. |
 | **Unicode normalization** | `café` (NFC) vs `café` (NFD) appear identical but are different bytes. Full normalization requires ICU. |
-| **TOCTOU race conditions** | Between path validation and file creation, a symlink could theoretically be created. Mitigated by secure overwrite, but not fully atomic. |
+| **Concurrent extraction** | If multiple threads/processes extract to the same destination, race conditions can occur. Use file locking or separate destinations. |
 | **Sparse file attacks** | Not applicable to zip format. |
 | **Hard links** | Zip format doesn't support hard links. |
 | **Device files** | Zip format doesn't support special device files. |
+
+### TOCTOU Mitigations
+
+For `OverwriteMode::Error` and `OverwriteMode::Skip`, we use **atomic file creation** (`O_CREAT | O_EXCL`) instead of check-then-create. This eliminates race conditions between checking if a file exists and creating it.
+
+For `OverwriteMode::Overwrite`, symlinks are removed before writing to prevent symlink-following attacks, but there's a brief window between removal and creation.
 
 ### Filename Restrictions
 
@@ -344,6 +391,25 @@ These filenames are **rejected** for security:
 - Paths longer than 1024 bytes
 - Path components longer than 255 bytes
 - Windows reserved names: `CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`
+
+## Development
+
+### Fuzzing
+
+We use [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) with two targets:
+
+```bash
+# Install cargo-fuzz (requires nightly)
+cargo install cargo-fuzz
+
+# Run the main extraction fuzzer
+cargo +nightly fuzz run fuzz_extract
+
+# Run the adapter fuzzer (tests parsing layer)
+cargo +nightly fuzz run fuzz_zip_adapter
+```
+
+Fuzzing targets are in `fuzz/fuzz_targets/`. Run fuzzing before releases to catch parsing edge cases.
 
 ## License
 

@@ -99,3 +99,11 @@ class AlreadyExistsError(SafeUnzipError):
     """File already exists and policy is 'error'."""
     ...
 
+class EncryptedArchiveError(SafeUnzipError):
+    """Archive contains encrypted entries (not supported)."""
+    ...
+
+class UnsupportedEntryTypeError(SafeUnzipError):
+    """Archive contains unsupported entry type (device file, fifo, etc.)."""
+    ...
+

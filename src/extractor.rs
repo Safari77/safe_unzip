@@ -237,7 +237,12 @@ impl Extractor {
             // 2. CHECK: Symlinks
             if entry.is_symlink() {
                 match self.symlinks {
-                    SymlinkPolicy::Error => return Err(Error::SymlinkNotAllowed { entry: name }),
+                    SymlinkPolicy::Error => {
+                        return Err(Error::SymlinkNotAllowed {
+                            entry: name,
+                            target: String::new(), // ZIP symlink targets require reading content
+                        });
+                    }
                     SymlinkPolicy::Skip => {
                         report.entries_skipped += 1;
                         continue;
@@ -302,53 +307,6 @@ impl Extractor {
                 });
             }
 
-            // println!("DEBUG: Checking existence - Path: {:?}, Exists: {}", safe_path, safe_path.exists());
-            if safe_path.exists() || fs::symlink_metadata(&safe_path).is_ok() {
-                match self.overwrite {
-                    OverwritePolicy::Error => {
-                        // Only error if it really exists (exists() handles symlinks too) but we want to be careful
-                        if safe_path.exists() {
-                            return Err(Error::AlreadyExists {
-                                path: safe_path.display().to_string(),
-                            });
-                        }
-                    }
-                    OverwritePolicy::Skip => {
-                        if safe_path.exists() {
-                            report.entries_skipped += 1;
-                            continue;
-                        }
-                    }
-                    OverwritePolicy::Overwrite => {
-                        // SECURITY: Secure Overwrite
-                        // If it's a symlink, we MUST remove it to avoid following it.
-                        // If it's a file, we remove it to ensure clean state.
-                        // If it's a directory, we leave it (create_dir_all handles it),
-                        // unless it's a file trying to overwrite a dir... handling that is complex,
-                        // but fs::remove_file fails on dirs usually.
-
-                        // Use symlink_metadata to check type without following
-                        let meta = fs::symlink_metadata(&safe_path);
-                        if let Ok(m) = meta {
-                            if m.is_dir() {
-                                if !entry.is_dir() {
-                                    // Trying to overwrite dir with file...
-                                    // For now, let File::create fail or do nothing
-                                }
-                            } else {
-                                // Valid file or symlink - REMOVE IT
-                                if let Err(e) = fs::remove_file(&safe_path) {
-                                    // If it doesn't exist (race?), ignore. Else error.
-                                    if e.kind() != std::io::ErrorKind::NotFound {
-                                        return Err(Error::Io(e));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
             // 7. EXECUTION
             if entry.is_dir() {
                 fs::create_dir_all(&safe_path)?;
@@ -357,6 +315,52 @@ impl Extractor {
                 if let Some(parent) = safe_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
+
+                // SECURITY: Atomic file creation based on overwrite policy
+                // Using create_new(true) eliminates TOCTOU race conditions
+                let outfile = match self.overwrite {
+                    OverwritePolicy::Error => {
+                        // create_new(true) is atomic: fails if file exists (no TOCTOU)
+                        match fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&safe_path)
+                        {
+                            Ok(f) => f,
+                            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                                return Err(Error::AlreadyExists {
+                                    entry: safe_path.display().to_string(),
+                                });
+                            }
+                            Err(e) => return Err(Error::Io(e)),
+                        }
+                    }
+                    OverwritePolicy::Skip => {
+                        // Try atomic create, skip on exists
+                        match fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&safe_path)
+                        {
+                            Ok(f) => f,
+                            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                                report.entries_skipped += 1;
+                                continue;
+                            }
+                            Err(e) => return Err(Error::Io(e)),
+                        }
+                    }
+                    OverwritePolicy::Overwrite => {
+                        // SECURITY: Remove any existing symlink first to prevent following
+                        if let Ok(m) = fs::symlink_metadata(&safe_path) {
+                            if m.file_type().is_symlink() {
+                                let _ = fs::remove_file(&safe_path);
+                            }
+                        }
+                        // Now create/truncate
+                        fs::File::create(&safe_path)?
+                    }
+                };
 
                 // SECURITY: LimitReader
                 // Enforce:
@@ -372,7 +376,7 @@ impl Extractor {
                 let hard_limit = limit_single.min(remaining_global);
 
                 let mut limiter = LimitReader::new(&mut entry, hard_limit);
-                let mut outfile = fs::File::create(&safe_path)?;
+                let mut outfile = outfile;
 
                 // We use io::copy, which loops until EOF or error.
                 // LimitReader returns EOF at limit.
@@ -482,7 +486,10 @@ impl Extractor {
 
             // 2. Symlink check
             if entry.is_symlink() && matches!(self.symlinks, SymlinkPolicy::Error) {
-                return Err(Error::SymlinkNotAllowed { entry: name });
+                return Err(Error::SymlinkNotAllowed {
+                    entry: name,
+                    target: String::new(), // ZIP symlink targets require reading content
+                });
             }
 
             // 3. Path depth check
