@@ -1,6 +1,8 @@
-# safe_unzip Specification (v0.1.2)
+# safe_unzip Specification (v0.1.2+)
 
 Archive extraction that won't ruin your day.
+
+> **Note:** This spec reflects v0.1.2 with Python TAR bindings added post-release.
 
 ## 1. Overview
 
@@ -27,6 +29,8 @@ Built on `path_jail` for path validation.
 | Invalid Filename | Control chars, `CON`, `NUL`, backslashes | Filename sanitization |
 | Overwrite | Replace existing sensitive file | `OverwritePolicy::Error` default |
 | Setuid Escalation | Archive creates setuid binaries | Permission bits stripped |
+| Device Files (TAR) | TAR contains block/char devices, FIFOs | `UnsupportedEntryType` error |
+| TOCTOU Race | Check-then-create race condition | Atomic `create_new(true)` |
 
 ## 3. Scope
 
@@ -341,6 +345,7 @@ pub enum Error {
     /// Archive contains symlink and policy is Error.
     SymlinkNotAllowed {
         entry: String,
+        target: String,  // Symlink target path
     },
     
     /// Exceeded maximum total bytes.
@@ -378,7 +383,7 @@ pub enum Error {
     
     /// File already exists and policy is Error.
     AlreadyExists {
-        path: String,
+        entry: String,  // Consistent naming
     },
     
     /// Filename contains invalid characters or reserved names.
@@ -392,6 +397,12 @@ pub enum Error {
         entry: String,
     },
     
+    /// Archive contains unsupported entry type (device file, fifo, etc.).
+    UnsupportedEntryType {
+        entry: String,
+        entry_type: String,
+    },
+    
     /// Destination directory does not exist.
     DestinationNotFound {
         path: String,
@@ -400,10 +411,7 @@ pub enum Error {
     /// Zip format error.
     Zip(zip::result::ZipError),
     
-    /// Tar format error.
-    Tar(std::io::Error),
-    
-    /// IO error.
+    /// IO error (includes TAR format errors).
     Io(std::io::Error),
     
     /// Path jail error.
@@ -416,14 +424,18 @@ impl std::fmt::Display for Error {
             Self::PathEscape { entry, detail } => {
                 write!(f, "path '{}' escapes destination: {}", entry, detail)
             }
-            Self::SymlinkNotAllowed { entry } => {
-                write!(f, "archive contains symlink '{}' (symlinks not allowed)", entry)
+            Self::SymlinkNotAllowed { entry, target } => {
+                if target.is_empty() {
+                    write!(f, "archive contains symlink '{}' (symlinks not allowed)", entry)
+                } else {
+                    write!(f, "archive contains symlink '{}' -> '{}' (symlinks not allowed)", entry, target)
+                }
             }
             Self::TotalSizeExceeded { limit, would_be } => {
                 write!(f, "extraction would write {} bytes, exceeding {} limit", would_be, limit)
             }
             Self::FileCountExceeded { limit, attempted } => {
-                write!(f, "archive contains {} files, exceeding {} limit", attempted, limit)
+                write!(f, "extraction stopped at entry {}: would exceed {} file limit", attempted, limit)
             }
             Self::FileTooLarge { entry, limit, size } => {
                 write!(f, "file '{}' is {} bytes (limit: {})", entry, size, limit)
@@ -435,8 +447,8 @@ impl std::fmt::Display for Error {
             Self::PathTooDeep { entry, depth, limit } => {
                 write!(f, "path '{}' has {} directory levels (limit: {})", entry, depth, limit)
             }
-            Self::AlreadyExists { path } => {
-                write!(f, "file '{}' already exists", path)
+            Self::AlreadyExists { entry } => {
+                write!(f, "file '{}' already exists", entry)
             }
             Self::InvalidFilename { entry, reason } => {
                 write!(f, "invalid filename '{}': {}", entry, reason)
@@ -447,8 +459,11 @@ impl std::fmt::Display for Error {
             Self::DestinationNotFound { path } => {
                 write!(f, "destination directory '{}' does not exist", path)
             }
+            Self::UnsupportedEntryType { entry, entry_type } => {
+                write!(f, "entry '{}' has unsupported type '{}' (device files, fifos not allowed)", 
+                    entry, entry_type)
+            }
             Self::Zip(e) => write!(f, "zip format error: {}", e),
-            Self::Tar(e) => write!(f, "tar format error: {}", e),
             Self::Io(e) => write!(f, "I/O error: {}", e),
             Self::Jail(e) => write!(f, "path validation error: {}", e),
         }
@@ -620,13 +635,25 @@ python/
 ### 7.2 API
 
 ```python
-from safe_unzip import extract, extract_file, Extractor
+from safe_unzip import (
+    # ZIP functions
+    extract_file, extract_bytes,
+    # TAR functions
+    extract_tar_file, extract_tar_gz_file, extract_tar_bytes,
+    # Builder
+    Extractor,
+)
 
-# Simple extraction
-report = extract("/var/uploads", file_object)
+# Simple ZIP extraction
 report = extract_file("/var/uploads", "archive.zip")
+report = extract_bytes("/var/uploads", zip_data)
 
-# With options
+# Simple TAR extraction
+report = extract_tar_file("/var/uploads", "archive.tar")
+report = extract_tar_gz_file("/var/uploads", "archive.tar.gz")
+report = extract_tar_bytes("/var/uploads", tar_data)
+
+# With options (works for both ZIP and TAR)
 extractor = (
     Extractor("/var/uploads")
     .max_total_mb(500)
@@ -636,10 +663,17 @@ extractor = (
     .overwrite("skip")          # "error" | "skip" | "overwrite"
     .symlinks("error")          # "skip" | "error"
     .mode("validate_first")     # "streaming" | "validate_first"
-    .filter(lambda e: e.name.endswith(".png"))
 )
-report = extractor.extract(file_object)
+
+# ZIP via Extractor
 report = extractor.extract_file("archive.zip")
+report = extractor.extract_bytes(zip_data)
+
+# TAR via Extractor
+report = extractor.extract_tar_file("archive.tar")
+report = extractor.extract_tar_gz_file("archive.tar.gz")
+report = extractor.extract_tar_bytes(tar_data)
+report = extractor.extract_tar_gz_bytes(tar_gz_data)
 
 # Report
 print(report.files_extracted)
@@ -690,19 +724,19 @@ except OSError as e:
     print(f"IO error: {e}")
 ```
 
-Exception hierarchy (keep simple for v0.1):
+Exception hierarchy:
 
 ```
 Exception
   SafeUnzipError (base)
-    PathEscapeError      # Traversal, symlink escape, broken symlink
-    SymlinkNotAllowedError
-    QuotaError           # All limit violations (size, count, depth)
-    AlreadyExistsError
+    PathEscapeError           # Traversal, invalid filename
+    SymlinkNotAllowedError    # Symlink with policy=error
+    QuotaError                # All limit violations (size, count, depth)
+    AlreadyExistsError        # File exists with policy=error
+    EncryptedArchiveError     # Encrypted ZIP entries
+    UnsupportedEntryTypeError # Device files, FIFOs in TAR
   OSError (for IO errors)
 ```
-
-Note: Don't over-refine the exception hierarchy in v0.1. `QuotaError` covers all limit violations. Subclasses can be added later without breaking existing `except QuotaError` handlers.
 
 ## 8. Project Structure
 
@@ -795,10 +829,17 @@ tests/fixtures/
 - Basic extraction (.tar)
 - Gzip extraction (.tar.gz)
 - Path traversal blocked
+- Absolute paths blocked/sanitized
+- Symlink policies (skip, error)
+- Hard links treated as symlinks
+- Device files rejected (block, char, fifo)
+- Setuid/setgid bits stripped
+- Size/count/depth limits enforced
 - ValidateFirst mode
 - Filter callback works
 
 **Python tests must verify:**
-- Same security guarantees as Rust
-- Exception hierarchy works (`PathEscapeError`, `QuotaError`, `EncryptedArchiveError`, etc.)
+- Same security guarantees as Rust (ZIP and TAR)
+- Exception hierarchy works (`PathEscapeError`, `QuotaError`, `EncryptedArchiveError`, `UnsupportedEntryTypeError`)
 - Builder API works with string policies
+- TAR extraction methods work
