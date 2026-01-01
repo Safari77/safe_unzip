@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.1.3] - 2026-01-01
 
 ### Added
 
@@ -10,7 +10,18 @@ All notable changes to this project will be documented in this file.
   - `safe_unzip::r#async::{extract_file, extract_bytes, AsyncExtractor}`
   - `extract_tar_file`, `extract_tar_gz_file`, `extract_tar_bytes`, `extract_tar_gz_bytes`
   - 15 async tests covering ZIP, TAR, and concurrent extraction
+- **Comprehensive Test Coverage**: ~140 tests total
+  - 25 policy unit tests (PathPolicy, SizePolicy, CountPolicy, etc.)
+  - Edge case tests (empty archives, directory-only, zero limits)
+  - Encrypted ZIP detection test
+- **Fuzzing Validated**: 2.2 million iterations with zero crashes
 - CI now tests with `--features async`
+
+### Changed
+
+- **Minimal ZIP Dependencies**: Use only deflate + time features
+  - Removes xz2, zstd, bzip2 transitive dependencies
+  - Lighter binary, faster builds
 
 ## [0.1.2] - 2025-12-31
 
