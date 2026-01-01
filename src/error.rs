@@ -44,6 +44,9 @@ pub enum Error {
     /// Filename contains invalid characters or reserved names.
     InvalidFilename { entry: String, reason: String },
 
+    /// Archive entry is encrypted (not supported).
+    EncryptedEntry { entry: String },
+
     /// Zip format error.
     Zip(zip::result::ZipError),
 
@@ -140,6 +143,13 @@ impl fmt::Display for Error {
             }
             Self::InvalidFilename { entry, reason } => {
                 write!(f, "invalid filename '{}': {}", entry, reason)
+            }
+            Self::EncryptedEntry { entry } => {
+                write!(
+                    f,
+                    "entry '{}' is encrypted (encrypted archives not supported)",
+                    entry
+                )
             }
             Self::Zip(e) => write!(f, "zip format error: {}", e),
             Self::Io(e) => write!(f, "I/O error: {}", e),

@@ -266,6 +266,7 @@ let report = Extractor::new("/var/uploads")?
 | **Invalid Filename** | Control chars, `CON`, `NUL` | Filename sanitization |
 | **Overwrite** | Replace sensitive files | `OverwritePolicy::Error` default |
 | **Setuid** | Create setuid executables | Permission bits stripped |
+| **Encrypted Archives** | Password handling complexity | Rejected (see [Encrypted Archives](#encrypted-archives)) |
 
 ## Default Limits
 
@@ -300,8 +301,11 @@ match extract_file("/var/uploads", "archive.zip") {
     Err(Error::AlreadyExists { path }) => {
         eprintln!("File already exists: {}", path);
     }
-    Err(Error::InvalidFilename { entry }) => {
+    Err(Error::InvalidFilename { entry, .. }) => {
         eprintln!("Invalid filename: {}", entry);
+    }
+    Err(Error::EncryptedEntry { entry }) => {
+        eprintln!("Encrypted entry not supported: {}", entry);
     }
     Err(e) => {
         eprintln!("Extraction failed: {}", e);
@@ -315,7 +319,17 @@ match extract_file("/var/uploads", "archive.zip") {
 
 - **Zip format only** — Tar/gzip support planned for v0.2
 - **Requires seekable input** — No stdin streaming (zip format requires reading the central directory at the end of the file)
-- **No password-protected zips** — Use the `zip` crate directly for encrypted archives
+- **No encrypted archives** — See below
+
+### Encrypted Archives
+
+`safe_unzip` does not support password-protected zip files. Encrypted entries are rejected with `Error::EncryptedEntry`.
+
+If you need to extract encrypted archives:
+1. Decrypt first using the `zip` crate directly
+2. Then extract with `safe_unzip`
+
+This is intentional—encryption handling is outside our security scope. Password management, key derivation, and cryptographic validation are complex domains that deserve dedicated tooling.
 
 ### Extraction Behavior
 
@@ -330,10 +344,16 @@ These threats are **not fully addressed** (by design or complexity):
 |------------|--------|
 | **Case-insensitive collisions** | On Windows/macOS, `File.txt` and `file.txt` map to the same file. We don't track extracted names to detect this. |
 | **Unicode normalization** | `café` (NFC) vs `café` (NFD) appear identical but are different bytes. Full normalization requires ICU. |
-| **TOCTOU race conditions** | Between path validation and file creation, a symlink could theoretically be created. Mitigated by secure overwrite, but not fully atomic. |
+| **Concurrent extraction** | If multiple threads/processes extract to the same destination, race conditions can occur. Use file locking or separate destinations. |
 | **Sparse file attacks** | Not applicable to zip format. |
 | **Hard links** | Zip format doesn't support hard links. |
 | **Device files** | Zip format doesn't support special device files. |
+
+### TOCTOU Mitigations
+
+For `OverwriteMode::Error` and `OverwriteMode::Skip`, we use **atomic file creation** (`O_CREAT | O_EXCL`) instead of check-then-create. This eliminates race conditions between checking if a file exists and creating it.
+
+For `OverwriteMode::Overwrite`, symlinks are removed before writing to prevent symlink-following attacks, but there's a brief window between removal and creation.
 
 ### Filename Restrictions
 
@@ -344,6 +364,25 @@ These filenames are **rejected** for security:
 - Paths longer than 1024 bytes
 - Path components longer than 255 bytes
 - Windows reserved names: `CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`
+
+## Development
+
+### Fuzzing
+
+We use [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) with two targets:
+
+```bash
+# Install cargo-fuzz (requires nightly)
+cargo install cargo-fuzz
+
+# Run the main extraction fuzzer
+cargo +nightly fuzz run fuzz_extract
+
+# Run the adapter fuzzer (tests parsing layer)
+cargo +nightly fuzz run fuzz_zip_adapter
+```
+
+Fuzzing targets are in `fuzz/fuzz_targets/`. Run fuzzing before releases to catch parsing edge cases.
 
 ## License
 

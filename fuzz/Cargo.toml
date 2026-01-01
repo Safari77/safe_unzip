@@ -1,0 +1,38 @@
+[package]
+name = "safe_unzip-fuzz"
+version = "0.0.0"
+authors = ["Automatically generated"]
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tempfile = "3"
+
+[dependencies.safe_unzip]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "fuzz_extract"
+path = "fuzz_targets/fuzz_extract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_zip_adapter"
+path = "fuzz_targets/fuzz_zip_adapter.rs"
+test = false
+doc = false
+bench = false
+
