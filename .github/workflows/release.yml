@@ -78,7 +78,9 @@ jobs:
         run: pip install maturin
       
       - name: Build sdist
-        run: cd python && maturin sdist
+        run: |
+          cp README.md python/README.md
+          cd python && maturin sdist
       
       - name: Upload sdist
         uses: actions/upload-artifact@v4
