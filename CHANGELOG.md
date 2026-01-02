@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.1.4] - 2026-01-02
 
 ### Added
 
@@ -14,7 +14,7 @@ All notable changes to this project will be documented in this file.
 - **Context Manager**: Pythonic resource handling
   - `with Extractor(...) as e:` for sync extraction
   - `async with AsyncExtractor(...) as e:` for async extraction
-- 8 new Python tests for listing and context managers
+- 8 new Python tests for listing and context managers (58 total)
 
 ## [0.1.3] - 2026-01-01
 
