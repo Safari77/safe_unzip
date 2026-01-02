@@ -574,3 +574,150 @@ def test_very_deep_nesting_tar(tmp_path):
          .max_depth(10)
          .extract_tar_bytes(tar_data))
 
+
+# ============================================================================
+# Async Tests
+# ============================================================================
+
+@pytest.mark.asyncio
+async def test_async_extract_bytes(tmp_path):
+    """Test async extraction from bytes."""
+    from safe_unzip import async_extract_bytes
+    
+    zip_data = create_simple_zip("hello.txt", b"Hello, World!")
+    
+    report = await async_extract_bytes(tmp_path, zip_data)
+    
+    assert report.files_extracted == 1
+    assert (tmp_path / "hello.txt").read_bytes() == b"Hello, World!"
+
+
+@pytest.mark.asyncio
+async def test_async_extractor_basic(tmp_path):
+    """Test AsyncExtractor with builder pattern."""
+    from safe_unzip import AsyncExtractor
+    
+    zip_data = create_simple_zip("test.txt", b"test content")
+    
+    report = await (
+        AsyncExtractor(tmp_path)
+        .max_total_mb(100)
+        .max_files(10)
+        .extract_bytes(zip_data)
+    )
+    
+    assert report.files_extracted == 1
+    assert (tmp_path / "test.txt").read_bytes() == b"test content"
+
+
+@pytest.mark.asyncio
+async def test_async_extract_tar_bytes(tmp_path):
+    """Test async TAR extraction."""
+    from safe_unzip import async_extract_tar_bytes
+    
+    tar_data = create_simple_tar("file.txt", b"tar content")
+    
+    report = await async_extract_tar_bytes(tmp_path, tar_data)
+    
+    assert report.files_extracted == 1
+    assert (tmp_path / "file.txt").read_bytes() == b"tar content"
+
+
+@pytest.mark.asyncio
+async def test_async_extractor_tar(tmp_path):
+    """Test AsyncExtractor with TAR files."""
+    from safe_unzip import AsyncExtractor
+    
+    tar_data = create_simple_tar("async.txt", b"async tar")
+    
+    report = await (
+        AsyncExtractor(tmp_path)
+        .max_files(5)
+        .extract_tar_bytes(tar_data)
+    )
+    
+    assert report.files_extracted == 1
+
+
+@pytest.mark.asyncio
+async def test_async_extract_tar_gz_bytes(tmp_path):
+    """Test async .tar.gz extraction."""
+    from safe_unzip import async_extract_tar_bytes
+    
+    # Create a .tar.gz
+    tar_buffer = io.BytesIO()
+    with tarfile.open(fileobj=tar_buffer, mode="w") as tf:
+        data = b"gzipped tar content"
+        info = tarfile.TarInfo(name="gz_file.txt")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+    tar_data = tar_buffer.getvalue()
+    
+    gz_buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=gz_buffer, mode="wb") as gz:
+        gz.write(tar_data)
+    gz_data = gz_buffer.getvalue()
+    
+    from safe_unzip import AsyncExtractor
+    report = await AsyncExtractor(tmp_path).extract_tar_gz_bytes(gz_data)
+    
+    assert report.files_extracted == 1
+    assert (tmp_path / "gz_file.txt").read_bytes() == b"gzipped tar content"
+
+
+@pytest.mark.asyncio
+async def test_async_concurrent_extractions(tmp_path):
+    """Test multiple async extractions running concurrently."""
+    import asyncio
+    from safe_unzip import async_extract_bytes
+    
+    # Create several zip files
+    zips = [
+        create_simple_zip(f"file{i}.txt", f"content {i}".encode())
+        for i in range(5)
+    ]
+    
+    # Create separate directories for each
+    dirs = [tmp_path / f"dir{i}" for i in range(5)]
+    for d in dirs:
+        d.mkdir()
+    
+    # Extract all concurrently
+    reports = await asyncio.gather(*[
+        async_extract_bytes(dirs[i], zips[i])
+        for i in range(5)
+    ])
+    
+    # Verify all succeeded
+    assert all(r.files_extracted == 1 for r in reports)
+    for i in range(5):
+        assert (dirs[i] / f"file{i}.txt").read_bytes() == f"content {i}".encode()
+
+
+@pytest.mark.asyncio
+async def test_async_path_escape_rejected(tmp_path):
+    """Test that path traversal is rejected in async mode."""
+    from safe_unzip import async_extract_bytes
+    
+    zip_data = create_simple_zip("../escape.txt", b"malicious")
+    
+    with pytest.raises(PathEscapeError):
+        await async_extract_bytes(tmp_path, zip_data)
+
+
+@pytest.mark.asyncio
+async def test_async_quota_enforced(tmp_path):
+    """Test that quotas are enforced in async mode."""
+    from safe_unzip import AsyncExtractor
+    
+    # 100 KB file
+    large_data = b"x" * (100 * 1024)
+    zip_data = create_simple_zip("large.txt", large_data)
+    
+    with pytest.raises(QuotaError):
+        await (
+            AsyncExtractor(tmp_path)
+            .max_total_mb(0)  # 0 MB limit
+            .extract_bytes(zip_data)
+        )
+

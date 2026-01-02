@@ -23,6 +23,13 @@ All notable changes to this project will be documented in this file.
   - Removes xz2, zstd, bzip2 transitive dependencies
   - Lighter binary, faster builds
 
+### Python Bindings
+
+- **Python Async API**: Pure Python async wrappers using `asyncio.to_thread()`
+  - `async_extract_file`, `async_extract_bytes`, `async_extract_tar_file`, etc.
+  - `AsyncExtractor` class with builder pattern
+  - 8 async tests for Python bindings
+
 ## [0.1.2] - 2025-12-31
 
 ### Added

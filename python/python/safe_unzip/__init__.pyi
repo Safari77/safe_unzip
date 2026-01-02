@@ -2,7 +2,7 @@
 
 from os import PathLike
 from pathlib import Path
-from typing import Union, Literal
+from typing import Union, Literal, Coroutine
 
 _PathType = Union[str, PathLike[str], Path]
 _OverwritePolicy = Literal["error", "skip", "overwrite"]
@@ -89,7 +89,74 @@ class Extractor:
         """Extract gzip-compressed TAR from bytes."""
         ...
 
-# ZIP convenience functions
+
+class AsyncExtractor:
+    """Async archive extractor with security constraints. Supports ZIP and TAR."""
+    
+    def __init__(self, destination: _PathType) -> None:
+        """Create async extractor for the given destination directory."""
+        ...
+    
+    def max_total_mb(self, mb: int) -> "AsyncExtractor":
+        """Set maximum total bytes to extract (in megabytes)."""
+        ...
+    
+    def max_files(self, count: int) -> "AsyncExtractor":
+        """Set maximum number of files to extract."""
+        ...
+    
+    def max_single_file_mb(self, mb: int) -> "AsyncExtractor":
+        """Set maximum size of a single file (in megabytes)."""
+        ...
+    
+    def max_depth(self, depth: int) -> "AsyncExtractor":
+        """Set maximum directory depth."""
+        ...
+    
+    def overwrite(self, policy: _OverwritePolicy) -> "AsyncExtractor":
+        """Set overwrite policy: 'error', 'skip', or 'overwrite'."""
+        ...
+    
+    def symlinks(self, policy: _SymlinkPolicy) -> "AsyncExtractor":
+        """Set symlink policy: 'skip' or 'error'."""
+        ...
+    
+    def mode(self, mode: _ExtractionMode) -> "AsyncExtractor":
+        """Set extraction mode: 'streaming' or 'validate_first'."""
+        ...
+    
+    # ZIP extraction (async)
+    async def extract_file(self, path: _PathType) -> Report:
+        """Extract a ZIP file asynchronously."""
+        ...
+    
+    async def extract_bytes(self, data: bytes) -> Report:
+        """Extract ZIP from bytes asynchronously."""
+        ...
+    
+    # TAR extraction (async)
+    async def extract_tar_file(self, path: _PathType) -> Report:
+        """Extract a TAR file asynchronously."""
+        ...
+    
+    async def extract_tar_gz_file(self, path: _PathType) -> Report:
+        """Extract a gzip-compressed TAR file (.tar.gz, .tgz) asynchronously."""
+        ...
+    
+    async def extract_tar_bytes(self, data: bytes) -> Report:
+        """Extract TAR from bytes asynchronously."""
+        ...
+    
+    async def extract_tar_gz_bytes(self, data: bytes) -> Report:
+        """Extract gzip-compressed TAR from bytes asynchronously."""
+        ...
+
+
+# ============================================================================
+# Sync Convenience Functions
+# ============================================================================
+
+# ZIP
 def extract_file(destination: _PathType, path: _PathType) -> Report:
     """Extract a ZIP file with default settings."""
     ...
@@ -98,7 +165,7 @@ def extract_bytes(destination: _PathType, data: bytes) -> Report:
     """Extract ZIP from bytes with default settings."""
     ...
 
-# TAR convenience functions
+# TAR
 def extract_tar_file(destination: _PathType, path: _PathType) -> Report:
     """Extract a TAR file with default settings."""
     ...
@@ -109,6 +176,33 @@ def extract_tar_gz_file(destination: _PathType, path: _PathType) -> Report:
 
 def extract_tar_bytes(destination: _PathType, data: bytes) -> Report:
     """Extract TAR from bytes with default settings."""
+    ...
+
+
+# ============================================================================
+# Async Convenience Functions
+# ============================================================================
+
+# ZIP
+async def async_extract_file(destination: _PathType, path: _PathType) -> Report:
+    """Extract a ZIP file asynchronously with default settings."""
+    ...
+
+async def async_extract_bytes(destination: _PathType, data: bytes) -> Report:
+    """Extract ZIP from bytes asynchronously with default settings."""
+    ...
+
+# TAR
+async def async_extract_tar_file(destination: _PathType, path: _PathType) -> Report:
+    """Extract a TAR file asynchronously with default settings."""
+    ...
+
+async def async_extract_tar_gz_file(destination: _PathType, path: _PathType) -> Report:
+    """Extract a gzip-compressed TAR file asynchronously with default settings."""
+    ...
+
+async def async_extract_tar_bytes(destination: _PathType, data: bytes) -> Report:
+    """Extract TAR from bytes asynchronously with default settings."""
     ...
 
 class SafeUnzipError(Exception):

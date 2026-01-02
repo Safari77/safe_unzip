@@ -322,6 +322,44 @@ let (zip_result, tar_result) = tokio::join!(
 
 The async API uses `spawn_blocking` internally, so extraction runs in a thread pool without blocking the async runtime.
 
+### Python Async API
+
+Python async support uses `asyncio.to_thread()` to run extraction in a thread pool:
+
+```python
+import asyncio
+from safe_unzip import async_extract_file, AsyncExtractor
+
+async def main():
+    # Simple async extraction
+    report = await async_extract_file("/var/uploads", "archive.zip")
+    
+    # TAR extraction
+    from safe_unzip import async_extract_tar_file
+    report = await async_extract_tar_file("/var/uploads", "archive.tar")
+    
+    # With options
+    report = await (
+        AsyncExtractor("/var/uploads")
+        .max_total_mb(500)
+        .max_files(1000)
+        .extract_file("archive.zip")
+    )
+
+asyncio.run(main())
+```
+
+Concurrent extraction:
+
+```python
+async def extract_all(archives):
+    tasks = [
+        async_extract_file(f"/uploads/{i}", path)
+        for i, path in enumerate(archives)
+    ]
+    return await asyncio.gather(*tasks)
+```
+
 ## Security Model
 
 | Threat | Attack Vector | Defense |
