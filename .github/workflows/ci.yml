@@ -103,7 +103,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       
       - name: Install dependencies
-        run: pip install maturin pytest
+        run: pip install maturin pytest pytest-asyncio
       
       - name: Build Python wheel
         env:
