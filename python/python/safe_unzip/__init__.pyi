@@ -2,12 +2,46 @@
 
 from os import PathLike
 from pathlib import Path
-from typing import Union, Literal, Coroutine
+from typing import Union, Literal, Coroutine, List, Optional
 
 _PathType = Union[str, PathLike[str], Path]
 _OverwritePolicy = Literal["error", "skip", "overwrite"]
 _SymlinkPolicy = Literal["skip", "error"]
 _ExtractionMode = Literal["streaming", "validate_first"]
+_EntryKind = Literal["file", "directory", "symlink"]
+
+
+class EntryInfo:
+    """Metadata for an archive entry."""
+    @property
+    def name(self) -> str:
+        """The path/name of the entry within the archive."""
+        ...
+    @property
+    def size(self) -> int:
+        """The uncompressed size in bytes."""
+        ...
+    @property
+    def kind(self) -> _EntryKind:
+        """The type of entry: 'file', 'directory', or 'symlink'."""
+        ...
+    @property
+    def is_file(self) -> bool:
+        """True if this is a regular file."""
+        ...
+    @property
+    def is_dir(self) -> bool:
+        """True if this is a directory."""
+        ...
+    @property
+    def is_symlink(self) -> bool:
+        """True if this is a symbolic link."""
+        ...
+    @property
+    def symlink_target(self) -> Optional[str]:
+        """The target path if this is a symlink, None otherwise."""
+        ...
+
 
 class Report:
     """Extraction report."""
@@ -29,10 +63,28 @@ class Report:
         ...
 
 class Extractor:
-    """Archive extractor with security constraints. Supports ZIP and TAR."""
+    """Archive extractor with security constraints. Supports ZIP and TAR.
+    
+    Can be used as a context manager:
+        with Extractor("/var/uploads") as e:
+            e.extract_file("archive.zip")
+    """
     
     def __init__(self, destination: _PathType) -> None:
         """Create extractor for the given destination directory."""
+        ...
+    
+    def __enter__(self) -> "Extractor":
+        """Enter the context manager."""
+        ...
+    
+    def __exit__(
+        self,
+        exc_type: Optional[type],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[object],
+    ) -> bool:
+        """Exit the context manager."""
         ...
     
     def max_total_mb(self, mb: int) -> "Extractor":
@@ -91,10 +143,28 @@ class Extractor:
 
 
 class AsyncExtractor:
-    """Async archive extractor with security constraints. Supports ZIP and TAR."""
+    """Async archive extractor with security constraints. Supports ZIP and TAR.
+    
+    Can be used as an async context manager:
+        async with AsyncExtractor("/var/uploads") as e:
+            await e.extract_file("archive.zip")
+    """
     
     def __init__(self, destination: _PathType) -> None:
         """Create async extractor for the given destination directory."""
+        ...
+    
+    async def __aenter__(self) -> "AsyncExtractor":
+        """Enter the async context manager."""
+        ...
+    
+    async def __aexit__(
+        self,
+        exc_type: Optional[type],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[object],
+    ) -> bool:
+        """Exit the async context manager."""
         ...
     
     def max_total_mb(self, mb: int) -> "AsyncExtractor":
@@ -204,6 +274,59 @@ async def async_extract_tar_gz_file(destination: _PathType, path: _PathType) -> 
 async def async_extract_tar_bytes(destination: _PathType, data: bytes) -> Report:
     """Extract TAR from bytes asynchronously with default settings."""
     ...
+
+
+# ============================================================================
+# Sync Listing Functions
+# ============================================================================
+
+# ZIP
+def list_zip_entries(path: _PathType) -> List[EntryInfo]:
+    """List entries in a ZIP file without extracting."""
+    ...
+
+def list_zip_bytes(data: bytes) -> List[EntryInfo]:
+    """List entries in ZIP bytes without extracting."""
+    ...
+
+# TAR
+def list_tar_entries(path: _PathType) -> List[EntryInfo]:
+    """List entries in a TAR file without extracting."""
+    ...
+
+def list_tar_gz_entries(path: _PathType) -> List[EntryInfo]:
+    """List entries in a gzip-compressed TAR file without extracting."""
+    ...
+
+def list_tar_bytes(data: bytes) -> List[EntryInfo]:
+    """List entries in TAR bytes without extracting."""
+    ...
+
+
+# ============================================================================
+# Async Listing Functions
+# ============================================================================
+
+async def async_list_zip_entries(path: _PathType) -> List[EntryInfo]:
+    """List entries in a ZIP file asynchronously without extracting."""
+    ...
+
+async def async_list_zip_bytes(data: bytes) -> List[EntryInfo]:
+    """List entries in ZIP bytes asynchronously without extracting."""
+    ...
+
+async def async_list_tar_entries(path: _PathType) -> List[EntryInfo]:
+    """List entries in a TAR file asynchronously without extracting."""
+    ...
+
+async def async_list_tar_gz_entries(path: _PathType) -> List[EntryInfo]:
+    """List entries in a gzip-compressed TAR file asynchronously."""
+    ...
+
+async def async_list_tar_bytes(data: bytes) -> List[EntryInfo]:
+    """List entries in TAR bytes asynchronously without extracting."""
+    ...
+
 
 class SafeUnzipError(Exception):
     """Base exception for safe_unzip errors."""

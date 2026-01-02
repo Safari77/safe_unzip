@@ -44,15 +44,22 @@ from typing import Union, Literal, Optional, Callable
 
 from safe_unzip._safe_unzip import (
     # Classes
-    Extractor,
+    Extractor as _RustExtractor,
     Report,
-    # Functions - ZIP
+    EntryInfo,
+    # Functions - ZIP extraction
     extract_file,
     extract_bytes,
-    # Functions - TAR
+    # Functions - TAR extraction
     extract_tar_file,
     extract_tar_gz_file,
     extract_tar_bytes,
+    # Functions - Listing (no extraction)
+    list_zip_entries,
+    list_zip_bytes,
+    list_tar_entries,
+    list_tar_gz_entries,
+    list_tar_bytes,
     # Exceptions
     SafeUnzipError,
     PathEscapeError,
@@ -67,6 +74,101 @@ _PathType = Union[str, PathLike, Path]
 _OverwritePolicy = Literal["error", "skip", "overwrite"]
 _SymlinkPolicy = Literal["skip", "error"]
 _ExtractionMode = Literal["streaming", "validate_first"]
+
+
+# ============================================================================
+# Extractor with context manager support
+# ============================================================================
+
+class Extractor:
+    """Archive extractor with security constraints. Supports ZIP and TAR.
+    
+    Can be used as a context manager:
+        with Extractor("/var/uploads") as e:
+            e.extract_file("archive.zip")
+    
+    Or with builder pattern:
+        report = (
+            Extractor("/var/uploads")
+            .max_total_mb(500)
+            .max_files(1000)
+            .extract_file("archive.zip")
+        )
+    """
+    
+    def __init__(self, destination: _PathType) -> None:
+        """Create extractor for the given destination directory."""
+        self._inner = _RustExtractor(destination)
+    
+    def __enter__(self) -> "Extractor":
+        """Enter the context manager."""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        """Exit the context manager."""
+        return False
+    
+    # Builder methods
+    def max_total_mb(self, mb: int) -> "Extractor":
+        """Set maximum total bytes to extract (in megabytes)."""
+        self._inner.max_total_mb(mb)
+        return self
+    
+    def max_files(self, count: int) -> "Extractor":
+        """Set maximum number of files to extract."""
+        self._inner.max_files(count)
+        return self
+    
+    def max_single_file_mb(self, mb: int) -> "Extractor":
+        """Set maximum size of a single file (in megabytes)."""
+        self._inner.max_single_file_mb(mb)
+        return self
+    
+    def max_depth(self, depth: int) -> "Extractor":
+        """Set maximum directory depth."""
+        self._inner.max_depth(depth)
+        return self
+    
+    def overwrite(self, policy: _OverwritePolicy) -> "Extractor":
+        """Set overwrite policy: 'error', 'skip', or 'overwrite'."""
+        self._inner.overwrite(policy)
+        return self
+    
+    def symlinks(self, policy: _SymlinkPolicy) -> "Extractor":
+        """Set symlink policy: 'skip' or 'error'."""
+        self._inner.symlinks(policy)
+        return self
+    
+    def mode(self, mode: _ExtractionMode) -> "Extractor":
+        """Set extraction mode: 'streaming' or 'validate_first'."""
+        self._inner.mode(mode)
+        return self
+    
+    # ZIP extraction
+    def extract_file(self, path: _PathType) -> Report:
+        """Extract a ZIP file."""
+        return self._inner.extract_file(path)
+    
+    def extract_bytes(self, data: bytes) -> Report:
+        """Extract ZIP from bytes."""
+        return self._inner.extract_bytes(data)
+    
+    # TAR extraction
+    def extract_tar_file(self, path: _PathType) -> Report:
+        """Extract a TAR file."""
+        return self._inner.extract_tar_file(path)
+    
+    def extract_tar_gz_file(self, path: _PathType) -> Report:
+        """Extract a gzip-compressed TAR file (.tar.gz, .tgz)."""
+        return self._inner.extract_tar_gz_file(path)
+    
+    def extract_tar_bytes(self, data: bytes) -> Report:
+        """Extract TAR from bytes."""
+        return self._inner.extract_tar_bytes(data)
+    
+    def extract_tar_gz_bytes(self, data: bytes) -> Report:
+        """Extract gzip-compressed TAR from bytes."""
+        return self._inner.extract_tar_gz_bytes(data)
 
 
 # ============================================================================
@@ -99,6 +201,35 @@ async def async_extract_tar_bytes(destination: _PathType, data: bytes) -> Report
 
 
 # ============================================================================
+# Async Listing Functions
+# ============================================================================
+
+async def async_list_zip_entries(path: _PathType) -> list:
+    """List entries in a ZIP file asynchronously without extracting."""
+    return await asyncio.to_thread(list_zip_entries, path)
+
+
+async def async_list_zip_bytes(data: bytes) -> list:
+    """List entries in ZIP bytes asynchronously without extracting."""
+    return await asyncio.to_thread(list_zip_bytes, data)
+
+
+async def async_list_tar_entries(path: _PathType) -> list:
+    """List entries in a TAR file asynchronously without extracting."""
+    return await asyncio.to_thread(list_tar_entries, path)
+
+
+async def async_list_tar_gz_entries(path: _PathType) -> list:
+    """List entries in a gzip-compressed TAR file asynchronously."""
+    return await asyncio.to_thread(list_tar_gz_entries, path)
+
+
+async def async_list_tar_bytes(data: bytes) -> list:
+    """List entries in TAR bytes asynchronously without extracting."""
+    return await asyncio.to_thread(list_tar_bytes, data)
+
+
+# ============================================================================
 # AsyncExtractor - Async wrapper for Extractor
 # ============================================================================
 
@@ -112,11 +243,23 @@ class AsyncExtractor:
             .max_files(1000)
             .extract_file("archive.zip")
         )
+    
+    Or as an async context manager:
+        async with AsyncExtractor("/var/uploads") as e:
+            await e.extract_file("archive.zip")
     """
     
     def __init__(self, destination: _PathType) -> None:
         """Create async extractor for the given destination directory."""
-        self._extractor = Extractor(destination)
+        self._extractor = _RustExtractor(destination)
+    
+    async def __aenter__(self) -> "AsyncExtractor":
+        """Enter the async context manager."""
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
+        """Exit the async context manager."""
+        return False
     
     def max_total_mb(self, mb: int) -> "AsyncExtractor":
         """Set maximum total bytes to extract (in megabytes)."""
@@ -185,13 +328,20 @@ __all__ = [
     "Extractor",
     "AsyncExtractor",
     "Report",
-    # Sync Functions - ZIP
+    "EntryInfo",
+    # Sync Functions - ZIP extraction
     "extract_file",
     "extract_bytes",
-    # Sync Functions - TAR
+    # Sync Functions - TAR extraction
     "extract_tar_file",
     "extract_tar_gz_file",
     "extract_tar_bytes",
+    # Sync Functions - Listing (no extraction)
+    "list_zip_entries",
+    "list_zip_bytes",
+    "list_tar_entries",
+    "list_tar_gz_entries",
+    "list_tar_bytes",
     # Async Functions - ZIP
     "async_extract_file",
     "async_extract_bytes",
@@ -199,6 +349,9 @@ __all__ = [
     "async_extract_tar_file",
     "async_extract_tar_gz_file",
     "async_extract_tar_bytes",
+    # Async Functions - Listing
+    "async_list_zip_entries",
+    "async_list_tar_entries",
     # Exceptions
     "SafeUnzipError",
     "PathEscapeError",

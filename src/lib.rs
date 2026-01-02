@@ -47,13 +47,13 @@ pub mod r#async {
 }
 
 pub use error::Error;
-pub use extractor::{EntryInfo, ExtractionMode, Extractor, OverwritePolicy, Report, SymlinkPolicy};
+pub use extractor::{ExtractionMode, Extractor, OverwritePolicy, Report, SymlinkPolicy};
 pub use limits::Limits;
 
 // Re-export new types
 pub use adapter::{TarAdapter, ZipAdapter};
 pub use driver::{Driver, ExtractionReport, OverwriteMode, ValidationMode};
-pub use entry::{Entry, EntryKind};
+pub use entry::{Entry, EntryInfo, EntryKind};
 pub use policy::{Policy, PolicyChain, PolicyConfig, SymlinkBehavior};
 
 /// Extract from a reader with default settings.
@@ -120,4 +120,109 @@ where
     let file = std::fs::File::open(file_path)?;
     let reader = std::io::BufReader::new(file);
     Extractor::new_or_create(destination)?.extract(reader)
+}
+
+/// List entries in a ZIP archive without extracting.
+///
+/// Returns metadata for all entries including name, size, and type.
+/// No files are written to disk.
+///
+/// # Example
+///
+/// ```no_run
+/// use safe_unzip::list_zip_entries;
+///
+/// let entries = list_zip_entries("archive.zip")?;
+/// for entry in entries {
+///     println!("{}: {} bytes, {:?}", entry.name, entry.size, entry.kind);
+/// }
+/// # Ok::<(), safe_unzip::Error>(())
+/// ```
+pub fn list_zip_entries<P: AsRef<std::path::Path>>(
+    path: P,
+) -> Result<Vec<entry::EntryInfo>, Error> {
+    let mut adapter = ZipAdapter::open(path)?;
+    adapter.entries_metadata()
+}
+
+/// List entries in a ZIP archive from a reader.
+pub fn list_zip<R: std::io::Read + std::io::Seek>(
+    reader: R,
+) -> Result<Vec<entry::EntryInfo>, Error> {
+    let mut adapter = ZipAdapter::new(reader)?;
+    adapter.entries_metadata()
+}
+
+/// List entries in a TAR archive without extracting.
+///
+/// Note: TAR is a sequential format, so listing requires reading
+/// through the entire archive (but not decompressing file content).
+///
+/// # Example
+///
+/// ```no_run
+/// use safe_unzip::list_tar_entries;
+///
+/// let entries = list_tar_entries("archive.tar")?;
+/// for entry in entries {
+///     println!("{}: {} bytes", entry.name, entry.size);
+/// }
+/// # Ok::<(), safe_unzip::Error>(())
+/// ```
+pub fn list_tar_entries<P: AsRef<std::path::Path>>(
+    path: P,
+) -> Result<Vec<entry::EntryInfo>, Error> {
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    list_tar(reader)
+}
+
+/// List entries in a gzip-compressed TAR archive.
+pub fn list_tar_gz_entries<P: AsRef<std::path::Path>>(
+    path: P,
+) -> Result<Vec<entry::EntryInfo>, Error> {
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    let decoder = flate2::read::GzDecoder::new(reader);
+    list_tar(decoder)
+}
+
+/// List entries in a TAR archive from a reader.
+pub fn list_tar<R: std::io::Read>(reader: R) -> Result<Vec<entry::EntryInfo>, Error> {
+    let mut entries = Vec::new();
+    let mut archive = tar::Archive::new(reader);
+
+    for entry_result in archive.entries()? {
+        let entry = entry_result?;
+        let header = entry.header();
+        let name = entry.path()?.to_string_lossy().into_owned();
+
+        let entry_type = header.entry_type();
+        let kind = match entry_type {
+            tar::EntryType::Regular | tar::EntryType::Continuous => EntryKind::File,
+            tar::EntryType::Directory => EntryKind::Directory,
+            tar::EntryType::Symlink | tar::EntryType::Link => {
+                let target = entry
+                    .link_name()?
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                EntryKind::Symlink { target }
+            }
+            other => {
+                return Err(Error::UnsupportedEntryType {
+                    entry: name,
+                    entry_type: format!("{:?}", other),
+                });
+            }
+        };
+
+        entries.push(entry::EntryInfo {
+            name,
+            size: header.size()?,
+            kind,
+            mode: header.mode().ok(),
+        });
+    }
+
+    Ok(entries)
 }

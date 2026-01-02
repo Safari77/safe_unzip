@@ -139,6 +139,64 @@ impl From<safe_unzip::ExtractionReport> for PyReport {
 }
 
 // ============================================================================
+// EntryInfo (for listing)
+// ============================================================================
+
+#[pyclass(name = "EntryInfo")]
+#[derive(Clone)]
+struct PyEntryInfo {
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    size: u64,
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    is_file: bool,
+    #[pyo3(get)]
+    is_dir: bool,
+    #[pyo3(get)]
+    is_symlink: bool,
+    #[pyo3(get)]
+    symlink_target: Option<String>,
+}
+
+#[pymethods]
+impl PyEntryInfo {
+    fn __repr__(&self) -> String {
+        format!(
+            "EntryInfo(name='{}', size={}, kind='{}')",
+            self.name, self.size, self.kind
+        )
+    }
+}
+
+impl From<safe_unzip::EntryInfo> for PyEntryInfo {
+    fn from(e: safe_unzip::EntryInfo) -> Self {
+        let (kind_str, is_file, is_dir, is_symlink, symlink_target) = match &e.kind {
+            safe_unzip::EntryKind::File => ("file".to_string(), true, false, false, None),
+            safe_unzip::EntryKind::Directory => ("directory".to_string(), false, true, false, None),
+            safe_unzip::EntryKind::Symlink { target } => (
+                "symlink".to_string(),
+                false,
+                false,
+                true,
+                Some(target.clone()),
+            ),
+        };
+        PyEntryInfo {
+            name: e.name,
+            size: e.size,
+            kind: kind_str,
+            is_file,
+            is_dir,
+            is_symlink,
+            symlink_target,
+        }
+    }
+}
+
+// ============================================================================
 // Extractor
 // ============================================================================
 
@@ -389,6 +447,47 @@ fn extract_tar_bytes(destination: PathBuf, data: &[u8]) -> PyResult<PyReport> {
 }
 
 // ============================================================================
+// Listing Functions
+// ============================================================================
+
+/// List entries in a ZIP file without extracting.
+#[pyfunction]
+fn list_zip_entries(path: PathBuf) -> PyResult<Vec<PyEntryInfo>> {
+    let entries = safe_unzip::list_zip_entries(&path).map_err(to_py_err)?;
+    Ok(entries.into_iter().map(PyEntryInfo::from).collect())
+}
+
+/// List entries in a ZIP from bytes without extracting.
+#[pyfunction]
+fn list_zip_bytes(data: &[u8]) -> PyResult<Vec<PyEntryInfo>> {
+    let cursor = std::io::Cursor::new(data.to_vec());
+    let entries = safe_unzip::list_zip(cursor).map_err(to_py_err)?;
+    Ok(entries.into_iter().map(PyEntryInfo::from).collect())
+}
+
+/// List entries in a TAR file without extracting.
+#[pyfunction]
+fn list_tar_entries(path: PathBuf) -> PyResult<Vec<PyEntryInfo>> {
+    let entries = safe_unzip::list_tar_entries(&path).map_err(to_py_err)?;
+    Ok(entries.into_iter().map(PyEntryInfo::from).collect())
+}
+
+/// List entries in a gzip-compressed TAR file without extracting.
+#[pyfunction]
+fn list_tar_gz_entries(path: PathBuf) -> PyResult<Vec<PyEntryInfo>> {
+    let entries = safe_unzip::list_tar_gz_entries(&path).map_err(to_py_err)?;
+    Ok(entries.into_iter().map(PyEntryInfo::from).collect())
+}
+
+/// List entries in a TAR from bytes without extracting.
+#[pyfunction]
+fn list_tar_bytes(data: &[u8]) -> PyResult<Vec<PyEntryInfo>> {
+    let cursor = std::io::Cursor::new(data.to_vec());
+    let entries = safe_unzip::list_tar(cursor).map_err(to_py_err)?;
+    Ok(entries.into_iter().map(PyEntryInfo::from).collect())
+}
+
+// ============================================================================
 // Module
 // ============================================================================
 
@@ -397,15 +496,23 @@ fn _safe_unzip(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Classes
     m.add_class::<PyExtractor>()?;
     m.add_class::<PyReport>()?;
+    m.add_class::<PyEntryInfo>()?;
 
-    // Functions - ZIP
+    // Functions - ZIP extraction
     m.add_function(wrap_pyfunction!(extract_file, m)?)?;
     m.add_function(wrap_pyfunction!(extract_bytes, m)?)?;
 
-    // Functions - TAR
+    // Functions - TAR extraction
     m.add_function(wrap_pyfunction!(extract_tar_file, m)?)?;
     m.add_function(wrap_pyfunction!(extract_tar_gz_file, m)?)?;
     m.add_function(wrap_pyfunction!(extract_tar_bytes, m)?)?;
+
+    // Functions - Listing (no extraction)
+    m.add_function(wrap_pyfunction!(list_zip_entries, m)?)?;
+    m.add_function(wrap_pyfunction!(list_zip_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(list_tar_entries, m)?)?;
+    m.add_function(wrap_pyfunction!(list_tar_gz_entries, m)?)?;
+    m.add_function(wrap_pyfunction!(list_tar_bytes, m)?)?;
 
     // Exceptions
     m.add("SafeUnzipError", py.get_type::<SafeUnzipError>())?;

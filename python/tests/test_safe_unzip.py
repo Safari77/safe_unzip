@@ -15,11 +15,18 @@ import pytest
 
 from safe_unzip import (
     Extractor,
+    AsyncExtractor,
+    EntryInfo,
     extract_file,
     extract_bytes,
     extract_tar_file,
     extract_tar_gz_file,
     extract_tar_bytes,
+    list_zip_entries,
+    list_zip_bytes,
+    list_tar_entries,
+    list_tar_bytes,
+    async_list_zip_bytes,
     PathEscapeError,
     QuotaError,
     AlreadyExistsError,
@@ -720,4 +727,125 @@ async def test_async_quota_enforced(tmp_path):
             .max_total_mb(0)  # 0 MB limit
             .extract_bytes(zip_data)
         )
+
+
+# ============================================================================
+# Listing Tests
+# ============================================================================
+
+def test_list_zip_bytes():
+    """Test listing ZIP entries without extracting."""
+    zip_data = create_multi_file_zip({
+        "a.txt": b"hello",
+        "dir/b.txt": b"world",
+    })
+    
+    entries = list_zip_bytes(zip_data)
+    
+    assert len(entries) == 2
+    assert entries[0].name == "a.txt"
+    assert entries[0].size == 5
+    assert entries[0].kind == "file"
+    assert entries[0].is_file
+    assert not entries[0].is_dir
+    assert not entries[0].is_symlink
+
+
+def test_list_tar_bytes():
+    """Test listing TAR entries without extracting."""
+    tar_data = create_multi_file_tar({
+        "x.txt": b"xxx",
+        "y.txt": b"yyyy",
+    })
+    
+    entries = list_tar_bytes(tar_data)
+    
+    assert len(entries) == 2
+    names = [e.name for e in entries]
+    assert "x.txt" in names
+    assert "y.txt" in names
+
+
+def test_list_with_directory():
+    """Test listing shows directories."""
+    # Create TAR with explicit directory entry
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tf:
+        # Add directory
+        dir_info = tarfile.TarInfo(name="mydir/")
+        dir_info.type = tarfile.DIRTYPE
+        tf.addfile(dir_info)
+        # Add file in directory
+        data = b"content"
+        file_info = tarfile.TarInfo(name="mydir/file.txt")
+        file_info.size = len(data)
+        tf.addfile(file_info, io.BytesIO(data))
+    tar_data = buffer.getvalue()
+    
+    entries = list_tar_bytes(tar_data)
+    
+    # Should have directory and file
+    kinds = [e.kind for e in entries]
+    assert "directory" in kinds
+    assert "file" in kinds
+
+
+@pytest.mark.asyncio
+async def test_async_list_zip_bytes():
+    """Test async listing of ZIP entries."""
+    zip_data = create_simple_zip("test.txt", b"async listing test")
+    
+    entries = await async_list_zip_bytes(zip_data)
+    
+    assert len(entries) == 1
+    assert entries[0].name == "test.txt"
+
+
+# ============================================================================
+# Context Manager Tests
+# ============================================================================
+
+def test_sync_context_manager(tmp_path):
+    """Test Extractor as sync context manager."""
+    zip_data = create_simple_zip("ctx.txt", b"context manager test")
+    
+    with Extractor(tmp_path) as ext:
+        report = ext.extract_bytes(zip_data)
+    
+    assert report.files_extracted == 1
+    assert (tmp_path / "ctx.txt").exists()
+
+
+def test_sync_context_manager_with_options(tmp_path):
+    """Test context manager with builder pattern."""
+    zip_data = create_simple_zip("opts.txt", b"options test")
+    
+    with Extractor(tmp_path) as ext:
+        ext.max_total_mb(100)
+        ext.max_files(50)
+        report = ext.extract_bytes(zip_data)
+    
+    assert report.files_extracted == 1
+
+
+@pytest.mark.asyncio
+async def test_async_context_manager(tmp_path):
+    """Test AsyncExtractor as async context manager."""
+    zip_data = create_simple_zip("async_ctx.txt", b"async context manager")
+    
+    async with AsyncExtractor(tmp_path) as ext:
+        report = await ext.extract_bytes(zip_data)
+    
+    assert report.files_extracted == 1
+    assert (tmp_path / "async_ctx.txt").exists()
+
+
+def test_context_manager_exception_propagates(tmp_path):
+    """Test that exceptions within context manager propagate correctly."""
+    class CustomError(Exception):
+        pass
+    
+    with pytest.raises(CustomError):
+        with Extractor(tmp_path) as ext:
+            raise CustomError("test error")
 

@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Archive Listing**: List entries without extracting
+  - Rust: `list_zip_entries()`, `list_tar_entries()`, `list_tar_gz_entries()`
+  - Python: `list_zip_entries()`, `list_zip_bytes()`, `list_tar_entries()`, etc.
+  - Async: `async_list_zip_bytes()`, `async_list_tar_bytes()`, etc.
+  - New `EntryInfo` class with `name`, `size`, `kind`, `is_file`, `is_dir`, `is_symlink`
+- **Context Manager**: Pythonic resource handling
+  - `with Extractor(...) as e:` for sync extraction
+  - `async with AsyncExtractor(...) as e:` for async extraction
+- 8 new Python tests for listing and context managers
+
 ## [0.1.3] - 2026-01-01
 
 ### Added
