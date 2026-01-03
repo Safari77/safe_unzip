@@ -1,4 +1,5 @@
 //! Tests for TAR archive extraction.
+#![cfg(feature = "tar")]
 
 use safe_unzip::{Driver, Limits, TarAdapter, ValidationMode};
 use std::io::Write;
