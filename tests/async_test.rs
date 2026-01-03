@@ -1,10 +1,9 @@
 //! Async API tests (requires `async` feature)
 #![cfg(feature = "async")]
 
-use safe_unzip::r#async::{
-    extract_bytes, extract_file, extract_tar_bytes, extract_tar_file, extract_tar_gz_file,
-    AsyncExtractor,
-};
+use safe_unzip::r#async::{extract_bytes, extract_file, AsyncExtractor};
+#[cfg(feature = "tar")]
+use safe_unzip::r#async::{extract_tar_bytes, extract_tar_file, extract_tar_gz_file};
 use safe_unzip::{Error, ExtractionMode, OverwritePolicy};
 use std::io::Write;
 use tempfile::tempdir;
@@ -26,6 +25,7 @@ fn create_simple_zip(filename: &str, content: &[u8]) -> Vec<u8> {
     buffer.into_inner()
 }
 
+#[cfg(feature = "tar")]
 fn create_simple_tar(filename: &str, content: &[u8]) -> Vec<u8> {
     let mut builder = tar::Builder::new(Vec::new());
     let mut header = tar::Header::new_gnu();
@@ -37,6 +37,7 @@ fn create_simple_tar(filename: &str, content: &[u8]) -> Vec<u8> {
     builder.into_inner().unwrap()
 }
 
+#[cfg(feature = "tar")]
 fn create_tar_gz(filename: &str, content: &[u8]) -> Vec<u8> {
     use flate2::write::GzEncoder;
     use flate2::Compression;
@@ -197,9 +198,10 @@ async fn test_async_size_limit() {
 }
 
 // ============================================================================
-// TAR Tests
+// TAR Tests (require `tar` feature)
 // ============================================================================
 
+#[cfg(feature = "tar")]
 #[tokio::test]
 async fn test_async_extract_tar_bytes() {
     let dest = tempdir().unwrap();
@@ -215,6 +217,7 @@ async fn test_async_extract_tar_bytes() {
     );
 }
 
+#[cfg(feature = "tar")]
 #[tokio::test]
 async fn test_async_extract_tar_file() {
     let dest = tempdir().unwrap();
@@ -230,6 +233,7 @@ async fn test_async_extract_tar_file() {
     assert!(dest.path().join("file.txt").exists());
 }
 
+#[cfg(feature = "tar")]
 #[tokio::test]
 async fn test_async_extract_tar_gz_file() {
     let dest = tempdir().unwrap();
@@ -247,6 +251,7 @@ async fn test_async_extract_tar_gz_file() {
     assert!(dest.path().join("compressed.txt").exists());
 }
 
+#[cfg(feature = "tar")]
 #[tokio::test]
 async fn test_async_tar_with_builder() {
     let dest = tempdir().unwrap();
@@ -267,7 +272,29 @@ async fn test_async_tar_with_builder() {
 // ============================================================================
 
 #[tokio::test]
-async fn test_async_concurrent_extractions() {
+async fn test_async_concurrent_zip_extractions() {
+    let dest1 = tempdir().unwrap();
+    let dest2 = tempdir().unwrap();
+
+    let zip1 = create_simple_zip("file1.txt", b"content1");
+    let zip2 = create_simple_zip("file2.txt", b"content2");
+
+    // Run extractions concurrently
+    let (r1, r2) = tokio::join!(
+        extract_bytes(dest1.path(), zip1),
+        extract_bytes(dest2.path(), zip2),
+    );
+
+    assert!(r1.is_ok());
+    assert!(r2.is_ok());
+
+    assert!(dest1.path().join("file1.txt").exists());
+    assert!(dest2.path().join("file2.txt").exists());
+}
+
+#[cfg(feature = "tar")]
+#[tokio::test]
+async fn test_async_concurrent_mixed_extractions() {
     let dest1 = tempdir().unwrap();
     let dest2 = tempdir().unwrap();
     let dest3 = tempdir().unwrap();

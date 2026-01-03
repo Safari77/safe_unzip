@@ -36,11 +36,8 @@
 //! For simple scripts or sync contexts, use the regular [`crate::extract`] functions.
 
 #[cfg(feature = "tar")]
-use crate::TarAdapter;
-use crate::{
-    Driver, Error, ExtractionMode, ExtractionReport, Extractor, Limits, OverwriteMode,
-    OverwritePolicy, Report, SymlinkBehavior, SymlinkPolicy, ValidationMode,
-};
+use crate::{Driver, ExtractionReport, OverwriteMode, SymlinkBehavior, TarAdapter, ValidationMode};
+use crate::{Error, ExtractionMode, Extractor, Limits, OverwritePolicy, Report, SymlinkPolicy};
 use std::path::{Path, PathBuf};
 use tokio::task::spawn_blocking;
 
@@ -237,6 +234,7 @@ impl AsyncExtractor {
             .mode(self.mode))
     }
 
+    #[cfg(feature = "tar")]
     fn build_driver(&self) -> Result<Driver, Error> {
         let driver = if self.create_destination {
             Driver::new_or_create(&self.destination)?
@@ -253,6 +251,7 @@ impl AsyncExtractor {
 }
 
 // Helper to convert between report types
+#[cfg(feature = "tar")]
 fn extraction_report_to_report(report: ExtractionReport) -> Report {
     Report {
         files_extracted: report.files_extracted,
@@ -262,7 +261,8 @@ fn extraction_report_to_report(report: ExtractionReport) -> Report {
     }
 }
 
-// Helper to convert policy types
+// Helper to convert policy types (only needed for TAR via Driver)
+#[cfg(feature = "tar")]
 fn convert_overwrite_policy(policy: OverwritePolicy) -> OverwriteMode {
     match policy {
         OverwritePolicy::Error => OverwriteMode::Error,
@@ -271,6 +271,7 @@ fn convert_overwrite_policy(policy: OverwritePolicy) -> OverwriteMode {
     }
 }
 
+#[cfg(feature = "tar")]
 fn convert_symlink_policy(policy: SymlinkPolicy) -> SymlinkBehavior {
     match policy {
         SymlinkPolicy::Skip => SymlinkBehavior::Skip,
@@ -278,6 +279,7 @@ fn convert_symlink_policy(policy: SymlinkPolicy) -> SymlinkBehavior {
     }
 }
 
+#[cfg(feature = "tar")]
 fn convert_extraction_mode(mode: ExtractionMode) -> ValidationMode {
     match mode {
         ExtractionMode::Streaming => ValidationMode::Streaming,
