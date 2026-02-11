@@ -54,7 +54,7 @@ impl SevenZAdapter {
         let mut entries = Vec::new();
 
         // Use the lower-level API to iterate entries
-        let mut archive = sevenz_rust::SevenZReader::open(path, sevenz_rust::Password::empty())
+        let mut archive = sevenz_rust2::ArchiveReader::open(path, sevenz_rust2::Password::empty())
             .map_err(|e| Error::Io(std::io::Error::other(format!("7z open error: {}", e))))?;
 
         // Iterate through all entries
