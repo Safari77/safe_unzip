@@ -17,6 +17,7 @@ use crate::policy::{
     CountPolicy, DepthPolicy, ExtractionState, PathPolicy, PolicyChain, SizePolicy,
     SymlinkBehavior, SymlinkPolicy,
 };
+use crate::Progress;
 
 /// What to do when a file already exists at the extraction path.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -81,6 +82,8 @@ pub struct Driver {
     /// Optional entry filter.
     #[allow(clippy::type_complexity)]
     filter: Option<Box<dyn Fn(&EntryInfo) -> bool + Send + Sync>>,
+    #[allow(clippy::type_complexity)]
+    on_progress: Option<Box<dyn Fn(&Progress) + Send + Sync>>,
     file_mode: Option<u32>,
     dir_mode: Option<u32>,
     junk_paths: bool,
@@ -116,11 +119,20 @@ impl Driver {
             overwrite: OverwriteMode::default(),
             symlinks: SymlinkBehavior::default(),
             validation: ValidationMode::default(),
+            on_progress: None,
             filter: None,
             file_mode: None,
             dir_mode: None,
             junk_paths: false,
         })
+    }
+
+    pub fn on_progress<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&Progress) + Send + Sync + 'static,
+    {
+        self.on_progress = Some(Box::new(callback));
+        self
     }
 
     pub fn file_mode(mut self, mode: u32) -> Self {
@@ -468,6 +480,7 @@ impl Driver {
         // ValidateFirst mode: cache all entries, validate, then extract
         if self.validation == ValidationMode::ValidateFirst {
             let entries = adapter.cache_all()?;
+            let total_entries = entries.len();
             let mut state = ExtractionState::default();
 
             // Validate all entries
@@ -481,8 +494,22 @@ impl Driver {
 
             // Extract from cache
             let mut state = ExtractionState::default();
+            let mut entry_index = 0;
+
             adapter.extract_cached(|info, data| {
+                if let Some(ref cb) = self.on_progress {
+                    cb(&Progress {
+                        entry_name: info.name.clone(),
+                        entry_size: info.size,
+                        entry_index,
+                        total_entries,
+                        bytes_written: state.bytes_written,
+                        files_extracted: state.files_extracted,
+                    });
+                }
                 self.extract_tar_entry_data(&info, data, &policies, &mut state)?;
+                entry_index += 1;
+
                 Ok(true)
             })?;
 
@@ -496,9 +523,22 @@ impl Driver {
 
         // Streaming mode: extract as we read
         let mut state = ExtractionState::default();
+        let mut entry_index = 0;
 
         adapter.for_each(|info, reader| {
+            if let Some(ref cb) = self.on_progress {
+                cb(&Progress {
+                    entry_name: info.name.clone(),
+                    entry_size: info.size,
+                    entry_index,
+                    total_entries: 0, // Unknown for streaming TAR
+                    bytes_written: state.bytes_written,
+                    files_extracted: state.files_extracted,
+                });
+            }
+
             self.extract_tar_entry(&info, reader, &policies, &mut state)?;
+            entry_index += 1;
             Ok(true)
         })?;
 
@@ -730,9 +770,22 @@ impl Driver {
     ) -> Result<ExtractionReport, Error> {
         let policies = self.build_policies()?;
         let mut state = ExtractionState::default();
+        let total_entries = adapter.len();
+        let mut entry_index = 0;
 
         adapter.for_each(|info, data| {
+            if let Some(ref cb) = self.on_progress {
+                cb(&Progress {
+                    entry_name: info.name.clone(),
+                    entry_size: info.size,
+                    entry_index,
+                    total_entries,
+                    bytes_written: state.bytes_written,
+                    files_extracted: state.files_extracted,
+                });
+            }
             self.extract_7z_entry(info, data, &policies, &mut state)?;
+            entry_index += 1;
             Ok(true)
         })?;
 

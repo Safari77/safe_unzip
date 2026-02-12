@@ -377,6 +377,22 @@ fn extract_tar(
         driver = driver.exclude_glob(&cli.exclude_patterns);
     }
 
+    if cli.verbose {
+        driver = driver.on_progress(|p| {
+            if p.total_entries > 0 {
+                println!(
+                    "[{}/{}] {}",
+                    p.entry_index + 1,
+                    p.total_entries,
+                    p.entry_name
+                );
+            } else {
+                // For streaming TAR, we don't know the total
+                println!("[{}] {}", p.entry_index + 1, p.entry_name);
+            }
+        });
+    }
+
     let report = match format {
         ArchiveFormat::Tar => driver.extract_tar_file(archive)?,
         ArchiveFormat::TarGz => driver.extract_tar_gz_file(archive)?,
