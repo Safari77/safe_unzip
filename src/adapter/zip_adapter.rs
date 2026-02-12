@@ -12,13 +12,21 @@ use crate::error::Error;
 /// Wraps the `zip` crate and provides a format-agnostic interface for extraction.
 pub struct ZipAdapter<R> {
     archive: zip::ZipArchive<R>,
+    password: Option<Vec<u8>>,
 }
 
 impl<R: Read + Seek> ZipAdapter<R> {
     /// Create a new ZipAdapter from a reader.
     pub fn new(reader: R) -> Result<Self, Error> {
         let archive = zip::ZipArchive::new(reader)?;
-        Ok(Self { archive })
+        Ok(Self {
+            archive,
+            password: None,
+        })
+    }
+
+    pub fn password<P: AsRef<[u8]>>(&mut self, password: Option<P>) {
+        self.password = password.map(|p| p.as_ref().to_vec());
     }
 
     /// Returns the number of entries in the archive.
@@ -90,7 +98,10 @@ impl<R: Read + Seek> ZipAdapter<R> {
         F: FnMut(EntryInfo, Option<&mut dyn Read>) -> Result<bool, Error>,
     {
         for i in 0..self.archive.len() {
-            let mut entry = self.archive.by_index(i)?;
+            let mut entry = match &self.password {
+                Some(pwd) => self.archive.by_index_decrypt(i, pwd)?,
+                None => self.archive.by_index(i)?,
+            };
             let name = entry.name().to_string();
 
             // Reject encrypted entries
@@ -144,11 +155,15 @@ impl<R: Read + Seek> ZipAdapter<R> {
         writer: &mut W,
         limit: u64,
     ) -> Result<(EntryInfo, u64), Error> {
-        let mut entry = self.archive.by_index(index)?;
+        let mut entry = match &self.password {
+            Some(pwd) => self.archive.by_index_decrypt(index, pwd)?,
+            None => self.archive.by_index(index)?,
+        };
+
         let name = entry.name().to_string();
 
         // Reject encrypted entries
-        if entry.encrypted() {
+        if entry.encrypted() && self.password.is_none() {
             return Err(Error::EncryptedEntry { entry: name });
         }
 

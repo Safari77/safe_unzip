@@ -124,6 +124,10 @@ struct Cli {
     /// Verbose mode - show each file extracted
     #[arg(short, long)]
     verbose: bool,
+
+    /// Password for encrypted archives
+    #[arg(long)]
+    password: Option<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -280,7 +284,8 @@ fn extract_zip(
         .overwrite(overwrite)
         .symlinks(symlinks)
         .mode(mode)
-        .junk_paths(cli.junk_paths);
+        .junk_paths(cli.junk_paths)
+        .password(cli.password.as_deref());
 
     if let Some(m) = cli.file_mode {
         extractor = extractor.file_mode(m);

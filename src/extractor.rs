@@ -136,6 +136,7 @@ pub struct Extractor {
     file_mode: Option<u32>,
     dir_mode: Option<u32>,
     junk_paths: bool,
+    password: Option<Vec<u8>>,
 }
 
 impl Extractor {
@@ -202,7 +203,13 @@ impl Extractor {
             file_mode: None,
             dir_mode: None,
             junk_paths: false,
+            password: None,
         })
+    }
+
+    pub fn password<P: AsRef<[u8]>>(mut self, password: Option<P>) -> Self {
+        self.password = password.map(|p| p.as_ref().to_vec());
+        self
     }
 
     pub fn file_mode(mut self, mode: u32) -> Self {
@@ -369,7 +376,10 @@ impl Extractor {
         let total_entries = archive.len();
 
         for i in 0..total_entries {
-            let mut entry = archive.by_index(i)?;
+            let mut entry = match &self.password {
+                Some(pwd) => archive.by_index_decrypt(i, pwd)?,
+                None => archive.by_index(i)?,
+            };
             let name = entry.name().to_string();
 
             // Call progress callback if set
@@ -759,7 +769,7 @@ impl Extractor {
     ///
     /// Returns an error if:
     /// - Any entry fails CRC32 validation
-    /// - Any entry is encrypted
+    /// - Archive is encrypted and password is incorrect
     /// - The archive is corrupted
     ///
     /// # Example
@@ -782,7 +792,7 @@ impl Extractor {
             let name = entry.name().to_string();
 
             // Check for encrypted entries
-            if entry.encrypted() {
+            if entry.encrypted() && self.password.is_none() {
                 return Err(Error::EncryptedEntry { entry: name });
             }
 
