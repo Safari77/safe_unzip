@@ -20,6 +20,7 @@ dist/
 .idea/
 .vscode/
 *.swp
+*~
 
 # Generated during build (copied from root)
 python/README.md
