@@ -16,9 +16,9 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_total_bytes: 1024 * 1024 * 1024, // 1 GB
-            max_file_count: 10_000,
-            max_single_file: 100 * 1024 * 1024, // 100 MB
+            max_total_bytes: 4096 * 1024 * 1024, // 4 GiB
+            max_file_count: 100_000,
+            max_single_file: 4096 * 1024 * 1024, // 4 GiB
             max_path_depth: 50,
         }
     }
