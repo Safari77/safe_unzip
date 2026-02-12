@@ -33,6 +33,16 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+#[derive(serde::Deserialize)]
+struct Config {
+    passwords: Option<PasswordsConfig>,
+}
+
+#[derive(serde::Deserialize)]
+struct PasswordsConfig {
+    list: Option<Vec<String>>,
+}
+
 #[derive(Parser)]
 #[command(
     name = "safe_unzip",
@@ -61,6 +71,10 @@ struct Cli {
     #[arg(long)]
     verify: bool,
 
+    /// Force fsync on every extracted file
+    #[arg(long)]
+    fsync: bool,
+
     /// Generate shell completions for the specified shell
     #[arg(long, value_enum)]
     completions: Option<Shell>,
@@ -80,10 +94,6 @@ struct Cli {
     /// Maximum directory depth
     #[arg(long)]
     max_depth: Option<usize>,
-
-    /// Force fsync on every extracted file
-    #[arg(long)]
-    fsync: bool,
 
     /// Override file permissions (octal, e.g., 644)
     #[arg(long, value_parser = parse_mode)]
@@ -218,9 +228,13 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<(), Error> {
+fn run(mut cli: Cli) -> Result<(), Error> {
     let archive = cli.archive.as_ref().expect("archive is required");
     let format = detect_format(archive);
+
+    if cli.password.is_none() {
+        cli.password = resolve_password(archive, &format, cli.verbose);
+    }
 
     // List mode
     if cli.list {
@@ -584,4 +598,134 @@ fn format_error(e: &Error) -> String {
         }
         _ => e.to_string(),
     }
+}
+
+fn resolve_password(archive: &Path, format: &ArchiveFormat, verbose: bool) -> Option<String> {
+    // Only attempt to resolve password if the archive actually needs one
+    if !requires_password(archive, format) {
+        return None;
+    }
+
+    // 1. Try passwords from config file
+    if let Some(config_passwords) = load_config_passwords(verbose) {
+        if verbose {
+            println!("Checking passwords from config...");
+        }
+        for pwd in config_passwords {
+            if verify_password(archive, format, &pwd) {
+                return Some(pwd);
+            }
+        }
+    }
+
+    // 2. Prompt user securely
+    eprint!("Archive is encrypted. Enter password: ");
+    match rpassword::read_password() {
+        Ok(pwd) => {
+            if !pwd.is_empty() {
+                Some(pwd)
+            } else {
+                None
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to read password: {}", e);
+            None
+        }
+    }
+}
+
+fn requires_password(path: &Path, format: &ArchiveFormat) -> bool {
+    match format {
+        ArchiveFormat::Zip => {
+            if let Ok(file) = std::fs::File::open(path) {
+                if let Ok(mut archive) = zip::ZipArchive::new(file) {
+                    for i in 0..archive.len() {
+                        let is_encrypted = if let Ok(entry) = archive.by_index_raw(i) {
+                            entry.encrypted()
+                        } else {
+                            false
+                        };
+                        if is_encrypted {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        // For other formats, assume password might be needed if prompted,
+        // or we can't easily check without trying to extract.
+        _ => true,
+    }
+}
+
+fn verify_password(path: &Path, format: &ArchiveFormat, password: &str) -> bool {
+    match format {
+        ArchiveFormat::Zip => {
+            if let Ok(file) = std::fs::File::open(path) {
+                if let Ok(mut archive) = zip::ZipArchive::new(file) {
+                    // Try to find an encrypted entry and decrypt it
+                    for i in 0..archive.len() {
+                        let is_encrypted = if let Ok(entry) = archive.by_index_raw(i) {
+                            entry.encrypted()
+                        } else {
+                            false
+                        };
+
+                        //eprintln!("Trying password {}", password);
+                        if is_encrypted {
+                            return match archive.by_index_decrypt(i, password.as_bytes()) {
+                                Ok(_) => true, // Password worked
+                                Err(_) => false,
+                            };
+                        }
+                    }
+                }
+            }
+            false
+        }
+        // Cannot verify easily for other formats without partial extraction
+        _ => false,
+    }
+}
+
+fn load_config_passwords(verbose: bool) -> Option<Vec<String>> {
+    let config_dir = dirs_next::config_dir()?;
+    let config_path = config_dir.join("safe_unzip.toml");
+
+    if config_path.exists() {
+        if verbose {
+            println!("Reading config from: {}", config_path.display());
+        }
+        match std::fs::read_to_string(&config_path) {
+            Ok(content) => match toml::from_str::<Config>(&content) {
+                Ok(config) => {
+                    if let Some(passwords_config) = config.passwords {
+                        if let Some(ref list) = passwords_config.list {
+                            if verbose {
+                                println!("Loaded {} passwords from config", list.len());
+                            }
+                        }
+                        return passwords_config.list;
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to parse config file {}: {}",
+                        config_path.display(),
+                        e
+                    );
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "Warning: Failed to read config file {}: {}",
+                    config_path.display(),
+                    e
+                );
+            }
+        }
+    }
+    None
 }
