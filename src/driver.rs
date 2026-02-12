@@ -81,6 +81,9 @@ pub struct Driver {
     /// Optional entry filter.
     #[allow(clippy::type_complexity)]
     filter: Option<Box<dyn Fn(&EntryInfo) -> bool + Send + Sync>>,
+    file_mode: Option<u32>,
+    dir_mode: Option<u32>,
+    junk_paths: bool,
 }
 
 impl Driver {
@@ -114,7 +117,25 @@ impl Driver {
             symlinks: SymlinkBehavior::default(),
             validation: ValidationMode::default(),
             filter: None,
+            file_mode: None,
+            dir_mode: None,
+            junk_paths: false,
         })
+    }
+
+    pub fn file_mode(mut self, mode: u32) -> Self {
+        self.file_mode = Some(mode);
+        self
+    }
+
+    pub fn dir_mode(mut self, mode: u32) -> Self {
+        self.dir_mode = Some(mode);
+        self
+    }
+
+    pub fn junk_paths(mut self, junk: bool) -> Self {
+        self.junk_paths = junk;
+        self
     }
 
     /// Set extraction limits.
@@ -148,6 +169,38 @@ impl Driver {
     {
         self.filter = Some(Box::new(f));
         self
+    }
+
+    // Updated extraction logic (applied across all adapters)
+    fn resolve_path(&self, name: &str) -> PathBuf {
+        if self.junk_paths {
+            let filename = Path::new(name).file_name().unwrap_or_default();
+            self.destination.join(filename)
+        } else {
+            self.destination.join(name)
+        }
+    }
+
+    // Applying permission overrides
+    #[cfg(unix)]
+    fn apply_permissions(
+        &self,
+        path: &Path,
+        info_mode: Option<u32>,
+        is_dir: bool,
+    ) -> Result<(), Error> {
+        use std::os::unix::fs::PermissionsExt;
+        let override_mode = if is_dir {
+            self.dir_mode
+        } else {
+            self.file_mode
+        };
+
+        if let Some(mode) = override_mode.or(info_mode) {
+            let safe_mode = mode & 0o0777;
+            fs::set_permissions(path, fs::Permissions::from_mode(safe_mode))?;
+        }
+        Ok(())
     }
 
     /// Extract only specific files by exact name.
@@ -303,7 +356,13 @@ impl Driver {
             return Ok(());
         }
 
-        let safe_path = self.destination.join(&info.name);
+        // Skip directory entries if junk_paths is enabled ---
+        if self.junk_paths && matches!(info.kind, EntryKind::Directory) {
+            state.entries_skipped += 1;
+            return Ok(());
+        }
+
+        let safe_path = self.resolve_path(&info.name);
 
         // Extract based on entry type
         match info.kind {
@@ -313,8 +372,10 @@ impl Driver {
                 state.dirs_created += 1;
             }
             EntryKind::File => {
-                if let Some(parent) = safe_path.parent() {
-                    fs::create_dir_all(parent)?;
+                if !self.junk_paths {
+                    if let Some(parent) = safe_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
                 }
 
                 // Atomic file creation based on overwrite mode
@@ -370,14 +431,7 @@ impl Driver {
                 );
 
                 let (_, written) = adapter.extract_to(index, &mut outfile, limit)?;
-
-                // Set permissions on Unix
-                #[cfg(unix)]
-                if let Some(mode) = info.mode {
-                    use std::os::unix::fs::PermissionsExt;
-                    let safe_mode = mode & 0o0777;
-                    fs::set_permissions(&safe_path, fs::Permissions::from_mode(safe_mode))?;
-                }
+                self.apply_permissions(&safe_path, info.mode, false)?;
 
                 state.bytes_written += written;
                 state.files_extracted += 1;
@@ -482,16 +536,24 @@ impl Driver {
             return Ok(());
         }
 
-        let safe_path = self.destination.join(&info.name);
+        if self.junk_paths && matches!(info.kind, EntryKind::Directory) {
+            state.entries_skipped += 1;
+            return Ok(());
+        }
+
+        let safe_path = self.resolve_path(&info.name);
 
         match info.kind {
             EntryKind::Directory => {
                 fs::create_dir_all(&safe_path)?;
+                self.apply_permissions(&safe_path, info.mode, true)?;
                 state.dirs_created += 1;
             }
             EntryKind::File => {
-                if let Some(parent) = safe_path.parent() {
-                    fs::create_dir_all(parent)?;
+                if !self.junk_paths {
+                    if let Some(parent) = safe_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
                 }
 
                 let outfile = self.open_for_write(&safe_path, state)?;
@@ -509,13 +571,7 @@ impl Driver {
                     state.bytes_written += written;
                 }
 
-                #[cfg(unix)]
-                if let Some(mode) = info.mode {
-                    use std::os::unix::fs::PermissionsExt;
-                    let safe_mode = mode & 0o0777;
-                    fs::set_permissions(&safe_path, fs::Permissions::from_mode(safe_mode))?;
-                }
-
+                self.apply_permissions(&safe_path, info.mode, false)?;
                 state.files_extracted += 1;
             }
             EntryKind::Symlink { .. } => {
@@ -543,6 +599,11 @@ impl Driver {
             }
         }
 
+        if self.junk_paths && matches!(info.kind, EntryKind::Directory) {
+            state.entries_skipped += 1;
+            return Ok(());
+        }
+
         // Check policies (already validated, but need for state updates)
         policies.check_all(info, state)?;
 
@@ -552,11 +613,12 @@ impl Driver {
             return Ok(());
         }
 
-        let safe_path = self.destination.join(&info.name);
+        let safe_path = self.resolve_path(&info.name);
 
         match info.kind {
             EntryKind::Directory => {
                 fs::create_dir_all(&safe_path)?;
+                self.apply_permissions(&safe_path, info.mode, true)?;
                 state.dirs_created += 1;
             }
             EntryKind::File => {
@@ -575,13 +637,7 @@ impl Driver {
                     state.bytes_written += data.len() as u64;
                 }
 
-                #[cfg(unix)]
-                if let Some(mode) = info.mode {
-                    use std::os::unix::fs::PermissionsExt;
-                    let safe_mode = mode & 0o0777;
-                    fs::set_permissions(&safe_path, fs::Permissions::from_mode(safe_mode))?;
-                }
-
+                self.apply_permissions(&safe_path, info.mode, false)?;
                 state.files_extracted += 1;
             }
             EntryKind::Symlink { .. } => {
@@ -708,16 +764,24 @@ impl Driver {
         // Validate with policies
         policies.check_all(info, state)?;
 
-        let safe_path = self.destination.join(&info.name);
+        if self.junk_paths && matches!(info.kind, EntryKind::Directory) {
+            state.entries_skipped += 1;
+            return Ok(());
+        }
+
+        let safe_path = self.resolve_path(&info.name);
 
         match info.kind {
             EntryKind::Directory => {
                 fs::create_dir_all(&safe_path)?;
+                self.apply_permissions(&safe_path, info.mode, true)?;
                 state.dirs_created += 1;
             }
             EntryKind::File => {
-                if let Some(parent) = safe_path.parent() {
-                    fs::create_dir_all(parent)?;
+                if !self.junk_paths {
+                    if let Some(parent) = safe_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
                 }
 
                 let outfile = self.open_for_write(&safe_path, state)?;
@@ -731,6 +795,7 @@ impl Driver {
                     state.bytes_written += bytes.len() as u64;
                 }
 
+                self.apply_permissions(&safe_path, info.mode, false)?;
                 state.files_extracted += 1;
             }
             EntryKind::Symlink { .. } => {

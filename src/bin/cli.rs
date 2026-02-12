@@ -81,6 +81,18 @@ struct Cli {
     #[arg(long)]
     max_depth: Option<usize>,
 
+    /// Override file permissions (octal, e.g., 644)
+    #[arg(long, value_parser = parse_mode)]
+    file_mode: Option<u32>,
+
+    /// Override directory permissions (octal, e.g., 755)
+    #[arg(long, value_parser = parse_mode)]
+    dir_mode: Option<u32>,
+
+    /// Ignore directory structure and extract all files to the destination root
+    #[arg(short = 'j', long)]
+    junk_paths: bool,
+
     /// Extract only files matching glob patterns (can be repeated)
     #[arg(long = "include", value_name = "PATTERN")]
     include_patterns: Vec<String>,
@@ -130,6 +142,10 @@ enum SymlinkMode {
     Skip,
     /// Error if archive contains symlinks
     Error,
+}
+
+fn parse_mode(s: &str) -> Result<u32, String> {
+    u32::from_str_radix(s, 8).map_err(|_| format!("Invalid octal mode: {}", s))
 }
 
 fn parse_size(s: &str) -> Result<u64, String> {
@@ -263,7 +279,15 @@ fn extract_zip(
         .limits(limits)
         .overwrite(overwrite)
         .symlinks(symlinks)
-        .mode(mode);
+        .mode(mode)
+        .junk_paths(cli.junk_paths);
+
+    if let Some(m) = cli.file_mode {
+        extractor = extractor.file_mode(m);
+    }
+    if let Some(m) = cli.dir_mode {
+        extractor = extractor.dir_mode(m);
+    }
 
     // Apply filters
     if !cli.only_files.is_empty() {
@@ -334,7 +358,8 @@ fn extract_tar(
         .limits(limits)
         .overwrite(overwrite_mode)
         .symlinks(symlink_behavior)
-        .validation(validation);
+        .validation(validation)
+        .junk_paths(cli.junk_paths);
 
     // Apply filters
     if !cli.only_files.is_empty() {

@@ -133,6 +133,9 @@ pub struct Extractor {
     // Progress callback
     #[allow(clippy::type_complexity)]
     on_progress: Option<Box<dyn Fn(&Progress) + Send + Sync>>,
+    file_mode: Option<u32>,
+    dir_mode: Option<u32>,
+    junk_paths: bool,
 }
 
 impl Extractor {
@@ -196,7 +199,25 @@ impl Extractor {
             mode: ExtractionMode::default(),
             filter: None,
             on_progress: None,
+            file_mode: None,
+            dir_mode: None,
+            junk_paths: false,
         })
+    }
+
+    pub fn file_mode(mut self, mode: u32) -> Self {
+        self.file_mode = Some(mode);
+        self
+    }
+
+    pub fn dir_mode(mut self, mode: u32) -> Self {
+        self.dir_mode = Some(mode);
+        self
+    }
+
+    pub fn junk_paths(mut self, junk: bool) -> Self {
+        self.junk_paths = junk;
+        self
     }
 
     pub fn limits(mut self, limits: Limits) -> Self {
@@ -381,8 +402,19 @@ impl Extractor {
                 detail: e.to_string(),
             })?;
 
-            // Construct safe_path manually to preserve symlinks in the path
-            let safe_path = self.root.join(&name);
+            // 1. Modified Path Resolution (Junk Paths)
+            let safe_path = if self.junk_paths {
+                let filename =
+                    Path::new(&name)
+                        .file_name()
+                        .ok_or_else(|| Error::InvalidFilename {
+                            entry: name.clone(),
+                            reason: "entry has no filename".to_string(),
+                        })?;
+                self.root.join(filename)
+            } else {
+                self.root.join(&name)
+            };
 
             // 2. CHECK: Symlinks
             if entry.is_symlink() {
@@ -398,6 +430,12 @@ impl Extractor {
                         continue;
                     }
                 }
+            }
+
+            // 2.5 CHECK: Junk Paths (Skip Directories)
+            if self.junk_paths && entry.is_dir() {
+                report.entries_skipped += 1;
+                continue;
             }
 
             // 3. CHECK: Limits (Depth)
@@ -461,9 +499,20 @@ impl Extractor {
             if entry.is_dir() {
                 fs::create_dir_all(&safe_path)?;
                 report.dirs_created += 1;
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Some(mode) = self.dir_mode.or_else(|| entry.unix_mode()) {
+                        let safe_mode = mode & 0o0777;
+                        fs::set_permissions(&safe_path, fs::Permissions::from_mode(safe_mode))?;
+                    }
+                }
             } else {
-                if let Some(parent) = safe_path.parent() {
-                    fs::create_dir_all(parent)?;
+                if !self.junk_paths {
+                    if let Some(parent) = safe_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
                 }
 
                 // SECURITY: Atomic file creation based on overwrite policy
@@ -588,7 +637,7 @@ impl Extractor {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    if let Some(mode) = entry.unix_mode() {
+                    if let Some(mode) = self.file_mode.or_else(|| entry.unix_mode()) {
                         // Strip setuid (0o4000), setgid (0o2000), sticky (0o1000) bits
                         // 0o0777 mask keeps only owner/group/other rwx flags
                         let safe_mode = mode & 0o0777;
