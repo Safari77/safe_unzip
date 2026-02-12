@@ -81,6 +81,10 @@ struct Cli {
     #[arg(long)]
     max_depth: Option<usize>,
 
+    /// Force fsync on every extracted file
+    #[arg(long)]
+    fsync: bool,
+
     /// Override file permissions (octal, e.g., 644)
     #[arg(long, value_parser = parse_mode)]
     file_mode: Option<u32>,
@@ -285,6 +289,7 @@ fn extract_zip(
         .symlinks(symlinks)
         .mode(mode)
         .junk_paths(cli.junk_paths)
+        .fsync(cli.fsync)
         .password(cli.password.as_deref());
 
     if let Some(m) = cli.file_mode {
@@ -364,7 +369,8 @@ fn extract_tar(
         .overwrite(overwrite_mode)
         .symlinks(symlink_behavior)
         .validation(validation)
-        .junk_paths(cli.junk_paths);
+        .junk_paths(cli.junk_paths)
+        .fsync(cli.fsync);
 
     // Apply filters
     if !cli.only_files.is_empty() {

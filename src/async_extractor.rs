@@ -53,6 +53,7 @@ pub struct AsyncExtractor {
     symlinks: SymlinkPolicy,
     mode: ExtractionMode,
     create_destination: bool,
+    fsync: bool,
 }
 
 impl AsyncExtractor {
@@ -74,6 +75,7 @@ impl AsyncExtractor {
             symlinks: SymlinkPolicy::default(),
             mode: ExtractionMode::default(),
             create_destination: false,
+            fsync: false,
         })
     }
 
@@ -90,7 +92,14 @@ impl AsyncExtractor {
             symlinks: SymlinkPolicy::default(),
             mode: ExtractionMode::default(),
             create_destination: true,
+            fsync: false,
         })
+    }
+
+    /// Set whether to fsync files after extraction.
+    pub fn fsync(mut self, fsync: bool) -> Self {
+        self.fsync = fsync;
+        self
     }
 
     /// Set resource limits.
@@ -232,6 +241,7 @@ impl AsyncExtractor {
             .overwrite(self.overwrite)
             .symlinks(self.symlinks)
             .mode(self.mode))
+            .fsync(self.fsync))
     }
 
     #[cfg(feature = "tar")]
@@ -247,6 +257,7 @@ impl AsyncExtractor {
             .overwrite(convert_overwrite_policy(self.overwrite))
             .symlinks(convert_symlink_policy(self.symlinks))
             .validation(convert_extraction_mode(self.mode)))
+            .fsync(self.fsync))
     }
 }
 

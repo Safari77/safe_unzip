@@ -137,6 +137,7 @@ pub struct Extractor {
     dir_mode: Option<u32>,
     junk_paths: bool,
     password: Option<Vec<u8>>,
+    fsync: bool,
 }
 
 impl Extractor {
@@ -204,7 +205,13 @@ impl Extractor {
             dir_mode: None,
             junk_paths: false,
             password: None,
+            fsync: false,
         })
+    }
+
+    pub fn fsync(mut self, fsync: bool) -> Self {
+        self.fsync = fsync;
+        self
     }
 
     pub fn password<P: AsRef<[u8]>>(mut self, password: Option<P>) -> Self {
@@ -623,6 +630,10 @@ impl Extractor {
                     // Specific check: if written == entry.size(), we are good.
                     // If written < entry.size() but we hit limit, it means limit < entry.size().
                     // Which implies one of the above errors triggered.
+                }
+
+                if self.fsync {
+                    outfile.sync_all()?;
                 }
 
                 // SECURITY: Detect zip bombs that lie about declared size.

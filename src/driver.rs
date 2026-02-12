@@ -87,6 +87,7 @@ pub struct Driver {
     file_mode: Option<u32>,
     dir_mode: Option<u32>,
     junk_paths: bool,
+    fsync: bool,
 }
 
 impl Driver {
@@ -124,7 +125,13 @@ impl Driver {
             file_mode: None,
             dir_mode: None,
             junk_paths: false,
+            fsync: false,
         })
+    }
+
+    pub fn fsync(mut self, fsync: bool) -> Self {
+        self.fsync = fsync;
+        self
     }
 
     pub fn on_progress<F>(mut self, callback: F) -> Self
@@ -443,6 +450,9 @@ impl Driver {
                 );
 
                 let (_, written) = adapter.extract_to(index, &mut outfile, limit)?;
+                if self.fsync {
+                    outfile.sync_all()?;
+                }
                 self.apply_permissions(&safe_path, info.mode, false)?;
 
                 state.bytes_written += written;
@@ -608,6 +618,9 @@ impl Driver {
                             .saturating_sub(state.bytes_written),
                     );
                     let written = crate::adapter::copy_limited(reader, &mut outfile, limit)?;
+                    if self.fsync {
+                        outfile.sync_all()?;
+                    }
                     state.bytes_written += written;
                 }
 
@@ -674,6 +687,9 @@ impl Driver {
                 if let Some(data) = data {
                     use std::io::Write;
                     outfile.write_all(data)?;
+                    if self.fsync {
+                        outfile.sync_all()?;
+                    }
                     state.bytes_written += data.len() as u64;
                 }
 
@@ -845,6 +861,9 @@ impl Driver {
                 if let Some(bytes) = data {
                     use std::io::Write;
                     outfile.write_all(bytes)?;
+                    if self.fsync {
+                        outfile.sync_all()?;
+                    }
                     state.bytes_written += bytes.len() as u64;
                 }
 
