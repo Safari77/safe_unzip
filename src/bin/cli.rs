@@ -675,10 +675,7 @@ fn verify_password(path: &Path, format: &ArchiveFormat, password: &str) -> bool 
 
                         //eprintln!("Trying password {}", password);
                         if is_encrypted {
-                            return match archive.by_index_decrypt(i, password.as_bytes()) {
-                                Ok(_) => true, // Password worked
-                                Err(_) => false,
-                            };
+                            return archive.by_index_decrypt(i, password.as_bytes()).is_ok();
                         }
                     }
                 }
