@@ -230,77 +230,112 @@ fn main() -> ExitCode {
 
 fn run(mut cli: Cli) -> Result<(), Error> {
     let archives = std::mem::take(&mut cli.archives);
+    let mut processed_count = 0;
+    let mut error_count = 0;
 
     for archive in &archives {
-        let format = detect_format(archive);
+        let size = std::fs::metadata(archive).map(|m| m.len()).unwrap_or(0);
 
-        if cli.password.is_none() {
-            cli.password = resolve_password(archive, &format, cli.verbose);
+        if !cli.quiet {
+            println!("Processing {} ({} bytes).", archive.display(), size);
         }
 
-        // List mode
-        if cli.list {
-            list_archive(archive, format, cli.quiet)?;
-            continue;
-        }
-
-        // Verify mode
-        if cli.verify {
-            verify_archive(archive, format, cli.quiet)?;
-            continue;
-        }
-
-        // Extract mode
-        let limits = Limits {
-            max_total_bytes: cli.max_size.unwrap_or(Limits::default().max_total_bytes),
-            max_file_count: cli.max_files.unwrap_or(Limits::default().max_file_count),
-            max_single_file: cli
-                .max_single_file
-                .unwrap_or(Limits::default().max_single_file),
-            max_path_depth: cli.max_depth.unwrap_or(Limits::default().max_path_depth),
-        };
-
-        let overwrite = match cli.overwrite {
-            OverwriteMode::Error => OverwritePolicy::Error,
-            OverwriteMode::Skip => OverwritePolicy::Skip,
-            OverwriteMode::Overwrite => OverwritePolicy::Overwrite,
-        };
-
-        let symlinks = match cli.symlinks {
-            SymlinkMode::Skip => SymlinkPolicy::Skip,
-            SymlinkMode::Error => SymlinkPolicy::Error,
-        };
-
-        let mode = if cli.validate_first {
-            ExtractionMode::ValidateFirst
-        } else {
-            ExtractionMode::Streaming
-        };
-
-        // Build extractor based on format
-        match format {
-            ArchiveFormat::Zip => extract_zip(&cli, archive, limits, overwrite, symlinks, mode)?,
-            ArchiveFormat::Tar | ArchiveFormat::TarGz => {
-                extract_tar(&cli, archive, format, limits, overwrite, symlinks, mode)?
+        match process_archive(&mut cli, archive) {
+            Ok(_) => processed_count += 1,
+            Err(e) => {
+                error_count += 1;
+                eprintln!("Error: {}", format_error(&e));
             }
-            ArchiveFormat::SevenZ => {
-                #[cfg(feature = "sevenz")]
-                {
-                    extract_sevenz(&cli, archive, limits, overwrite, symlinks, mode)?
-                }
-                #[cfg(not(feature = "sevenz"))]
-                {
-                    eprintln!("Error: 7z support requires --features sevenz");
-                    return Err(Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        "7z not supported in this build",
-                    )));
-                }
-            }
+        }
+
+        if !cli.quiet {
+            println!();
         }
     }
 
-    Ok(())
+    if !cli.quiet {
+        println!(
+            "Processed {} archives, {} archives with errors.",
+            processed_count + error_count,
+            error_count
+        );
+    }
+
+    if error_count > 0 {
+        Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "One or more archives failed to process",
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn process_archive(cli: &mut Cli, archive: &Path) -> Result<(), Error> {
+    let format = detect_format(archive);
+
+    if cli.password.is_none() {
+        cli.password = resolve_password(archive, &format, cli.verbose);
+    }
+
+    // List mode
+    if cli.list {
+        return list_archive(archive, format, cli.quiet);
+    }
+
+    // Verify mode
+    if cli.verify {
+        return verify_archive(archive, format, cli.quiet);
+    }
+
+    // Extract mode
+    let limits = Limits {
+        max_total_bytes: cli.max_size.unwrap_or(Limits::default().max_total_bytes),
+        max_file_count: cli.max_files.unwrap_or(Limits::default().max_file_count),
+        max_single_file: cli
+            .max_single_file
+            .unwrap_or(Limits::default().max_single_file),
+        max_path_depth: cli.max_depth.unwrap_or(Limits::default().max_path_depth),
+    };
+
+    let overwrite = match cli.overwrite {
+        OverwriteMode::Error => OverwritePolicy::Error,
+        OverwriteMode::Skip => OverwritePolicy::Skip,
+        OverwriteMode::Overwrite => OverwritePolicy::Overwrite,
+    };
+
+    let symlinks = match cli.symlinks {
+        SymlinkMode::Skip => SymlinkPolicy::Skip,
+        SymlinkMode::Error => SymlinkPolicy::Error,
+    };
+
+    let mode = if cli.validate_first {
+        ExtractionMode::ValidateFirst
+    } else {
+        ExtractionMode::Streaming
+    };
+
+    // Build extractor based on format
+    match format {
+        ArchiveFormat::Zip => extract_zip(&cli, archive, limits, overwrite, symlinks, mode),
+        ArchiveFormat::Tar | ArchiveFormat::TarGz => {
+            extract_tar(&cli, archive, format, limits, overwrite, symlinks, mode)
+        }
+        ArchiveFormat::SevenZ => {
+            #[cfg(feature = "sevenz")]
+            {
+                extract_sevenz(&cli, archive, limits, overwrite, symlinks, mode)
+            }
+            #[cfg(not(feature = "sevenz"))]
+            {
+                eprintln!("Error: 7z support requires --features sevenz");
+                Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "7z not supported in this build",
+                )))
+            }
+        }
+    }
 }
 
 fn extract_zip(
