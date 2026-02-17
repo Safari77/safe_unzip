@@ -93,7 +93,7 @@ fn to_py_err(err: safe_unzip::Error) -> PyErr {
 // Report
 // ============================================================================
 
-#[pyclass(name = "Report")]
+#[pyclass(name = "Report", from_py_object)]
 #[derive(Clone)]
 struct PyReport {
     #[pyo3(get)]
@@ -142,7 +142,7 @@ impl From<safe_unzip::ExtractionReport> for PyReport {
 // EntryInfo (for listing)
 // ============================================================================
 
-#[pyclass(name = "EntryInfo")]
+#[pyclass(name = "EntryInfo", from_py_object)]
 #[derive(Clone)]
 struct PyEntryInfo {
     #[pyo3(get)]
@@ -214,8 +214,7 @@ struct PyExtractor {
     only_names: Option<Vec<String>>,
     include_patterns: Option<Vec<String>>,
     exclude_patterns: Option<Vec<String>>,
-    // Progress callback
-    progress_callback: Option<PyObject>,
+    progress_callback: Option<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -346,21 +345,21 @@ impl PyExtractor {
     ///         print(f"[{p['entry_index']+1}/{p['total_entries']}] {p['entry_name']}")
     ///     
     ///     extractor.on_progress(on_progress).extract_file("archive.zip")
-    fn on_progress(mut slf: PyRefMut<'_, Self>, callback: PyObject) -> PyRefMut<'_, Self> {
+    fn on_progress(mut slf: PyRefMut<'_, Self>, callback: Py<PyAny>) -> PyRefMut<'_, Self> {
         slf.progress_callback = Some(callback);
         slf
     }
 
     /// Extract from a file path.
-    fn extract_file(&self, path: PathBuf) -> PyResult<PyReport> {
-        let extractor = self.build_extractor()?;
+    fn extract_file(&self, py: Python<'_>, path: PathBuf) -> PyResult<PyReport> {
+        let extractor = self.build_extractor(py)?;
         let report = extractor.extract_file(path).map_err(to_py_err)?;
         Ok(report.into())
     }
 
     /// Extract from bytes.
-    fn extract_bytes(&self, data: &[u8]) -> PyResult<PyReport> {
-        let extractor = self.build_extractor()?;
+    fn extract_bytes(&self, py: Python<'_>, data: &[u8]) -> PyResult<PyReport> {
+        let extractor = self.build_extractor(py)?;
         let cursor = std::io::Cursor::new(data.to_vec());
         let report = extractor.extract(cursor).map_err(to_py_err)?;
         Ok(report.into())
@@ -416,8 +415,19 @@ impl PyExtractor {
 }
 
 impl PyExtractor {
-    fn build_extractor(&self) -> PyResult<safe_unzip::Extractor> {
-        let mut extractor = safe_unzip::Extractor::new(&self.destination).map_err(to_py_err)?;
+    fn build_extractor(&self, py: Python<'_>) -> PyResult<safe_unzip::Extractor> {
+        // Clone all fields upfront so nothing borrows from &self.
+        // This is necessary because on_progress requires a 'static closure,
+        // which forces the entire Extractor to be 'static-compatible.
+        let destination = self.destination.clone();
+        let only_names = self.only_names.clone();
+        let include_patterns = self.include_patterns.clone();
+        let exclude_patterns = self.exclude_patterns.clone();
+        // Py<PyAny> requires the GIL to clone in pyo3 0.28
+        let progress_callback: Option<Py<PyAny>> =
+            self.progress_callback.as_ref().map(|cb| cb.clone_ref(py));
+
+        let mut extractor = safe_unzip::Extractor::new(&destination).map_err(to_py_err)?;
 
         extractor = extractor.limits(safe_unzip::Limits {
             max_total_bytes: self.max_total_bytes,
@@ -442,23 +452,21 @@ impl PyExtractor {
             _ => extractor.mode(safe_unzip::ExtractionMode::Streaming),
         };
 
-        // Apply filters
-        if let Some(ref names) = self.only_names {
+        // Apply filters (using owned clones, not refs to self)
+        if let Some(ref names) = only_names {
             extractor = extractor.only(names);
         }
-        if let Some(ref patterns) = self.include_patterns {
+        if let Some(ref patterns) = include_patterns {
             extractor = extractor.include_glob(patterns);
         }
-        if let Some(ref patterns) = self.exclude_patterns {
+        if let Some(ref patterns) = exclude_patterns {
             extractor = extractor.exclude_glob(patterns);
         }
 
         // Apply progress callback
-        if let Some(ref callback) = self.progress_callback {
-            // Clone with GIL to get a 'static PyObject
-            let callback: PyObject = Python::with_gil(|py| callback.clone_ref(py));
+        if let Some(callback) = progress_callback {
             extractor = extractor.on_progress(move |progress| {
-                Python::with_gil(|py| {
+                if let Some(()) = pyo3::Python::try_attach(|py| {
                     let dict = pyo3::types::PyDict::new(py);
                     let _ = dict.set_item("entry_name", &progress.entry_name);
                     let _ = dict.set_item("entry_size", progress.entry_size);
@@ -466,8 +474,8 @@ impl PyExtractor {
                     let _ = dict.set_item("total_entries", progress.total_entries);
                     let _ = dict.set_item("bytes_written", progress.bytes_written);
                     let _ = dict.set_item("files_extracted", progress.files_extracted);
-                    let _ = callback.call1(py, (dict,));
-                });
+                    let _ = callback.bind(py).call1((dict,));
+                }) {}
             });
         }
 
@@ -623,7 +631,7 @@ fn list_tar_bytes(data: &[u8]) -> PyResult<Vec<PyEntryInfo>> {
 // ============================================================================
 
 /// Report returned by verify functions.
-#[pyclass(name = "VerifyReport")]
+#[pyclass(name = "VerifyReport", from_py_object)]
 #[derive(Clone)]
 struct PyVerifyReport {
     #[pyo3(get)]
