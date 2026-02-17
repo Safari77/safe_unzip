@@ -1,11 +1,11 @@
 [package]
 name = "safe_unzip"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/tenuo-ai/safe_unzip"
-homepage = "https://tenuo.dev"
-authors = ["Niki A. <dev@tenuo.dev>"]
+repository = "https://github.com/Safari77/safe_unzip"
+# Forked from https://github.com/tenuo-ai/safe_unzip
+authors = ["Sami Farin"]
 description = "Secure zip extraction. Prevents Zip Slip and Zip Bombs."
 keywords = ["zip", "security", "archive", "extraction", "safe"]
 categories = ["filesystem", "compression"]
