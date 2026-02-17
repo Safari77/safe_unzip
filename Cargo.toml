@@ -26,7 +26,7 @@ path = "src/bin/cli.rs"
 required-features = ["cli"]
 
 [dependencies]
-path_jail = { version = "0.3", features = ["secure-open"] }
+path_jail = { git = "https://github.com/Safari77/path_jail", features = ["secure-open"] }
 clap = { version = "4", features = ["derive"], optional = true }
 clap_complete = { version = "4", optional = true }
 zip = { version = "8", default-features = false, features = ["deflate", "deflate64", "lzma", "time", "chrono", "aes-crypto"] }
