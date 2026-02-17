@@ -55,9 +55,9 @@ struct PasswordsConfig {
     safe_unzip archive.zip --list"
 )]
 struct Cli {
-    /// Archive file to extract (ZIP, TAR, TAR.GZ)
+    /// Archive files to extract (ZIP, TAR, TAR.GZ)
     #[arg(required_unless_present = "completions")]
-    archive: Option<PathBuf>,
+    archives: Vec<PathBuf>,
 
     /// Destination directory (created if missing)
     #[arg(short, long, default_value = ".")]
@@ -229,71 +229,78 @@ fn main() -> ExitCode {
 }
 
 fn run(mut cli: Cli) -> Result<(), Error> {
-    let archive = cli.archive.as_ref().expect("archive is required");
-    let format = detect_format(archive);
+    let archives = std::mem::take(&mut cli.archives);
 
-    if cli.password.is_none() {
-        cli.password = resolve_password(archive, &format, cli.verbose);
-    }
+    for archive in &archives {
+        let format = detect_format(archive);
 
-    // List mode
-    if cli.list {
-        return list_archive(archive, format, cli.quiet);
-    }
-
-    // Verify mode
-    if cli.verify {
-        return verify_archive(archive, format, cli.quiet);
-    }
-
-    // Extract mode
-    let limits = Limits {
-        max_total_bytes: cli.max_size.unwrap_or(Limits::default().max_total_bytes),
-        max_file_count: cli.max_files.unwrap_or(Limits::default().max_file_count),
-        max_single_file: cli
-            .max_single_file
-            .unwrap_or(Limits::default().max_single_file),
-        max_path_depth: cli.max_depth.unwrap_or(Limits::default().max_path_depth),
-    };
-
-    let overwrite = match cli.overwrite {
-        OverwriteMode::Error => OverwritePolicy::Error,
-        OverwriteMode::Skip => OverwritePolicy::Skip,
-        OverwriteMode::Overwrite => OverwritePolicy::Overwrite,
-    };
-
-    let symlinks = match cli.symlinks {
-        SymlinkMode::Skip => SymlinkPolicy::Skip,
-        SymlinkMode::Error => SymlinkPolicy::Error,
-    };
-
-    let mode = if cli.validate_first {
-        ExtractionMode::ValidateFirst
-    } else {
-        ExtractionMode::Streaming
-    };
-
-    // Build extractor based on format
-    match format {
-        ArchiveFormat::Zip => extract_zip(&cli, archive, limits, overwrite, symlinks, mode),
-        ArchiveFormat::Tar | ArchiveFormat::TarGz => {
-            extract_tar(&cli, archive, format, limits, overwrite, symlinks, mode)
+        if cli.password.is_none() {
+            cli.password = resolve_password(archive, &format, cli.verbose);
         }
-        ArchiveFormat::SevenZ => {
-            #[cfg(feature = "sevenz")]
-            {
-                extract_sevenz(&cli, archive, limits, overwrite, symlinks, mode)
+
+        // List mode
+        if cli.list {
+            list_archive(archive, format, cli.quiet)?;
+            continue;
+        }
+
+        // Verify mode
+        if cli.verify {
+            verify_archive(archive, format, cli.quiet)?;
+            continue;
+        }
+
+        // Extract mode
+        let limits = Limits {
+            max_total_bytes: cli.max_size.unwrap_or(Limits::default().max_total_bytes),
+            max_file_count: cli.max_files.unwrap_or(Limits::default().max_file_count),
+            max_single_file: cli
+                .max_single_file
+                .unwrap_or(Limits::default().max_single_file),
+            max_path_depth: cli.max_depth.unwrap_or(Limits::default().max_path_depth),
+        };
+
+        let overwrite = match cli.overwrite {
+            OverwriteMode::Error => OverwritePolicy::Error,
+            OverwriteMode::Skip => OverwritePolicy::Skip,
+            OverwriteMode::Overwrite => OverwritePolicy::Overwrite,
+        };
+
+        let symlinks = match cli.symlinks {
+            SymlinkMode::Skip => SymlinkPolicy::Skip,
+            SymlinkMode::Error => SymlinkPolicy::Error,
+        };
+
+        let mode = if cli.validate_first {
+            ExtractionMode::ValidateFirst
+        } else {
+            ExtractionMode::Streaming
+        };
+
+        // Build extractor based on format
+        match format {
+            ArchiveFormat::Zip => extract_zip(&cli, archive, limits, overwrite, symlinks, mode)?,
+            ArchiveFormat::Tar | ArchiveFormat::TarGz => {
+                extract_tar(&cli, archive, format, limits, overwrite, symlinks, mode)?
             }
-            #[cfg(not(feature = "sevenz"))]
-            {
-                eprintln!("Error: 7z support requires --features sevenz");
-                Err(Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "7z not supported in this build",
-                )))
+            ArchiveFormat::SevenZ => {
+                #[cfg(feature = "sevenz")]
+                {
+                    extract_sevenz(&cli, archive, limits, overwrite, symlinks, mode)?
+                }
+                #[cfg(not(feature = "sevenz"))]
+                {
+                    eprintln!("Error: 7z support requires --features sevenz");
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "7z not supported in this build",
+                    )));
+                }
             }
         }
     }
+
+    Ok(())
 }
 
 fn extract_zip(
@@ -645,7 +652,7 @@ fn verify_archive(path: &Path, format: ArchiveFormat, quiet: bool) -> Result<(),
 
             if !quiet {
                 println!(
-                    "✓ Verified {} entries ({})",
+                    "Verified {} entries ({})",
                     report.entries_verified,
                     format_bytes(report.bytes_verified)
                 );
@@ -663,7 +670,7 @@ fn verify_archive(path: &Path, format: ArchiveFormat, quiet: bool) -> Result<(),
 
             if !quiet {
                 println!(
-                    "✓ Verified {} entries ({})",
+                    "Verified {} entries ({})",
                     entries.len(),
                     format_bytes(total_size)
                 );
@@ -679,7 +686,7 @@ fn verify_archive(path: &Path, format: ArchiveFormat, quiet: bool) -> Result<(),
 
                 if !quiet {
                     println!(
-                        "✓ Verified {} entries ({})",
+                        "Verified {} entries ({})",
                         entries.len(),
                         format_bytes(total_size)
                     );
