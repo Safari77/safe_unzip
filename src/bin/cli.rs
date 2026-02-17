@@ -280,11 +280,18 @@ fn run(mut cli: Cli) -> Result<(), Error> {
             extract_tar(&cli, archive, format, limits, overwrite, symlinks, mode)
         }
         ArchiveFormat::SevenZ => {
-            eprintln!("Error: 7z support requires --features sevenz");
-            Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "7z not supported in this build",
-            )))
+            #[cfg(feature = "sevenz")]
+            {
+                extract_sevenz(&cli, archive, limits, overwrite, symlinks, mode)
+            }
+            #[cfg(not(feature = "sevenz"))]
+            {
+                eprintln!("Error: 7z support requires --features sevenz");
+                Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "7z not supported in this build",
+                )))
+            }
         }
     }
 }
@@ -416,8 +423,95 @@ fn extract_tar(
     let report = match format {
         ArchiveFormat::Tar => driver.extract_tar_file(archive)?,
         ArchiveFormat::TarGz => driver.extract_tar_gz_file(archive)?,
+        ArchiveFormat::SevenZ => {
+            #[cfg(feature = "sevenz")]
+            {
+                driver.extract_7z_file(archive)?
+            }
+            #[cfg(not(feature = "sevenz"))]
+            {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "7z not supported",
+                )));
+            }
+        }
         _ => unreachable!(),
     };
+
+    if !cli.quiet {
+        println!(
+            "Extracted {} files ({} bytes) to {}",
+            report.files_extracted,
+            format_bytes(report.bytes_written),
+            cli.dest.display()
+        );
+        if report.entries_skipped > 0 {
+            println!("Skipped {} entries", report.entries_skipped);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "sevenz")]
+fn extract_sevenz(
+    cli: &Cli,
+    archive: &Path,
+    limits: Limits,
+    overwrite: OverwritePolicy,
+    symlinks: SymlinkPolicy,
+    mode: ExtractionMode,
+) -> Result<(), Error> {
+    // Map policies to Driver types
+    let overwrite_mode = match overwrite {
+        OverwritePolicy::Error => safe_unzip::OverwriteMode::Error,
+        OverwritePolicy::Skip => safe_unzip::OverwriteMode::Skip,
+        OverwritePolicy::Overwrite => safe_unzip::OverwriteMode::Overwrite,
+    };
+
+    let symlink_behavior = match symlinks {
+        SymlinkPolicy::Skip => safe_unzip::SymlinkBehavior::Skip,
+        SymlinkPolicy::Error => safe_unzip::SymlinkBehavior::Error,
+    };
+
+    // Note: 7z adapter currently loads all into memory, so ValidateFirst vs Streaming
+    // distinction is less relevant here, but Driver handles validation.
+    let validation = match mode {
+        ExtractionMode::Streaming => safe_unzip::ValidationMode::Streaming,
+        ExtractionMode::ValidateFirst => safe_unzip::ValidationMode::ValidateFirst,
+    };
+
+    let mut driver = Driver::new_or_create(&cli.dest)?
+        .limits(limits)
+        .overwrite(overwrite_mode)
+        .symlinks(symlink_behavior)
+        .validation(validation)
+        .junk_paths(cli.junk_paths)
+        .fsync(cli.fsync);
+
+    // Apply filters
+    if !cli.only_files.is_empty() {
+        driver = driver.only(&cli.only_files);
+    }
+    if !cli.include_patterns.is_empty() {
+        driver = driver.include_glob(&cli.include_patterns);
+    }
+    if !cli.exclude_patterns.is_empty() {
+        driver = driver.exclude_glob(&cli.exclude_patterns);
+    }
+
+    if cli.verbose {
+        // We know total entries for 7z because it decompresses upfront
+        let adapter = safe_unzip::SevenZAdapter::open(archive)?;
+        let total_entries = adapter.len();
+
+        driver = driver.on_progress(move |p| {
+            println!("[{}/{}] {}", p.entry_index + 1, total_entries, p.entry_name);
+        });
+    }
+
+    let report = driver.extract_7z_file(archive)?;
 
     if !cli.quiet {
         println!(
@@ -497,11 +591,43 @@ fn list_archive(path: &Path, format: ArchiveFormat, quiet: bool) -> Result<(), E
             }
         }
         ArchiveFormat::SevenZ => {
-            eprintln!("Error: 7z listing requires --features sevenz");
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "7z not supported in this build",
-            )));
+            #[cfg(feature = "sevenz")]
+            {
+                let adapter = safe_unzip::SevenZAdapter::open(path)?;
+                let entries = adapter.entries_metadata();
+
+                if !quiet {
+                    println!("{} entries in {}:", entries.len(), path.display());
+                    println!();
+                }
+
+                let mut total_size = 0u64;
+                for entry in &entries {
+                    let kind = match entry.kind {
+                        safe_unzip::EntryKind::File => "",
+                        safe_unzip::EntryKind::Directory => "/",
+                        safe_unzip::EntryKind::Symlink { .. } => " -> [symlink]",
+                    };
+                    println!("{:>10}  {}{}", format_bytes(entry.size), entry.name, kind);
+                    total_size += entry.size;
+                }
+                if !quiet {
+                    println!();
+                    println!(
+                        "Total: {} files, {}",
+                        entries.len(),
+                        format_bytes(total_size)
+                    );
+                }
+            }
+            #[cfg(not(feature = "sevenz"))]
+            {
+                eprintln!("Error: 7z listing requires --features sevenz");
+                Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "7z not supported in this build",
+                )))
+            }
         }
     }
 
@@ -544,11 +670,29 @@ fn verify_archive(path: &Path, format: ArchiveFormat, quiet: bool) -> Result<(),
             }
         }
         ArchiveFormat::SevenZ => {
-            eprintln!("Error: 7z verification requires --features sevenz");
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "7z not supported in this build",
-            )));
+            #[cfg(feature = "sevenz")]
+            {
+                // SevenZAdapter decompresses fully on open, effectively verifying integrity
+                let adapter = safe_unzip::SevenZAdapter::open(path)?;
+                let entries = adapter.entries_metadata();
+                let total_size: u64 = entries.iter().map(|e| e.size).sum();
+
+                if !quiet {
+                    println!(
+                        "✓ Verified {} entries ({})",
+                        entries.len(),
+                        format_bytes(total_size)
+                    );
+                }
+            }
+            #[cfg(not(feature = "sevenz"))]
+            {
+                eprintln!("Error: 7z verification requires --features sevenz");
+                Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "7z not supported in this build",
+                )))
+            }
         }
     }
 
@@ -682,8 +826,59 @@ fn verify_password(path: &Path, format: &ArchiveFormat, password: &str) -> bool 
             }
             false
         }
+        ArchiveFormat::SevenZ => {
+            #[cfg(feature = "sevenz")]
+            {
+                verify_7z_password(path, password)
+            }
+            #[cfg(not(feature = "sevenz"))]
+            {
+                false
+            }
+        }
         // Cannot verify easily for other formats without partial extraction
         _ => false,
+    }
+}
+
+#[cfg(feature = "sevenz")]
+fn verify_7z_password(path: &Path, password: &str) -> bool {
+    use sevenz_rust2::{ArchiveReader, Password};
+
+    // 1. Try to open the archive with the password.
+    // If headers are encrypted, this will fail if the password is wrong.
+    match ArchiveReader::open(path, Password::from(password)) {
+        Ok(mut archive) => {
+            let mut valid = false;
+            let mut found_file = false;
+
+            // 2. If open succeeded (headers OK), we must verify content decryption.
+            // If headers are NOT encrypted, open() succeeds with ANY password.
+            // So we must try to read at least one file's content.
+            let _ = archive.for_each_entries(|entry, reader| {
+                if !entry.is_directory() {
+                    found_file = true;
+                    // Try to read 1 byte to trigger decryption/MAC check
+                    let mut buf = [0u8; 1];
+                    match reader.read(&mut buf) {
+                        Ok(_) => valid = true,
+                        Err(_) => valid = false,
+                    }
+                    // Stop after checking the first file
+                    return Ok(false);
+                }
+                Ok(true) // Skip directories
+            });
+
+            // If we found a file and read it successfully, password is correct.
+            if found_file {
+                valid
+            } else {
+                // If archive is empty or only has dirs, and we opened it, assume password is OK
+                true
+            }
+        }
+        Err(_) => false, // Open failed (e.g. encrypted headers with wrong password)
     }
 }
 
