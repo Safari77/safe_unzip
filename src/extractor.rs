@@ -2,7 +2,7 @@ use crate::error::Error;
 use crate::limits::Limits;
 use path_jail::Jail;
 use std::fs;
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, Write};
 use std::path::{Component, Path};
 
 /// What to do when a file already exists at the extraction path.
@@ -599,7 +599,17 @@ impl Extractor {
                 // BUT we need to distinguish EOF at limit vs natural EOF.
                 // If EOF at limit AND entry has more data -> Error.
 
-                let written = std::io::copy(&mut limiter, &mut outfile)?;
+                let mut buffer = [0u8; 65536];
+                let mut written = 0;
+
+                loop {
+                    let len = limiter.read(&mut buffer)?;
+                    if len == 0 {
+                        break; // Reached EOF or hit the security limit
+                    }
+                    outfile.write_all(&buffer[..len])?;
+                    written += len as u64;
+                }
 
                 // Check if we hit the limit strictly
                 if limiter.hit_limit {
@@ -762,7 +772,7 @@ impl Extractor {
     /// Extract from a file path. Convenience wrapper around `extract()`.
     pub fn extract_file<P: AsRef<Path>>(&self, path: P) -> Result<Report, Error> {
         let file = fs::File::open(path)?;
-        let reader = std::io::BufReader::new(file);
+        let reader = std::io::BufReader::with_capacity(65536, file);
         self.extract(reader)
     }
 
@@ -813,7 +823,7 @@ impl Extractor {
             }
 
             // Read the entire entry (triggers CRC validation in zip crate)
-            let mut buf = [0u8; 8192];
+            let mut buf = [0u8; 65536];
             let mut entry_bytes = 0u64;
             loop {
                 match entry.read(&mut buf) {
@@ -841,7 +851,7 @@ impl Extractor {
     /// Verify archive integrity from a file path.
     pub fn verify_file<P: AsRef<Path>>(&self, path: P) -> Result<VerifyReport, Error> {
         let file = fs::File::open(path)?;
-        let reader = std::io::BufReader::new(file);
+        let reader = std::io::BufReader::with_capacity(65536, file);
         self.verify(reader)
     }
 
