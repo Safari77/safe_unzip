@@ -47,7 +47,7 @@ fn default_state() -> safe_unzip::policy::ExtractionState {
 #[test]
 fn test_path_policy_normal_file() {
     let dest = tempdir().unwrap();
-    let policy = PathPolicy::new(dest.path()).unwrap();
+    let policy = PathPolicy::new(dest.path(), false).unwrap();
     let state = default_state();
 
     let entry = file_info("normal.txt", 100);
@@ -57,7 +57,7 @@ fn test_path_policy_normal_file() {
 #[test]
 fn test_path_policy_blocks_traversal() {
     let dest = tempdir().unwrap();
-    let policy = PathPolicy::new(dest.path()).unwrap();
+    let policy = PathPolicy::new(dest.path(), false).unwrap();
     let state = default_state();
 
     let entry = file_info("../escape.txt", 100);
@@ -68,7 +68,7 @@ fn test_path_policy_blocks_traversal() {
 #[test]
 fn test_path_policy_blocks_double_dot() {
     let dest = tempdir().unwrap();
-    let policy = PathPolicy::new(dest.path()).unwrap();
+    let policy = PathPolicy::new(dest.path(), false).unwrap();
     let state = default_state();
 
     let entry = file_info("foo/../../bar.txt", 100);
@@ -79,7 +79,7 @@ fn test_path_policy_blocks_double_dot() {
 #[test]
 fn test_path_policy_blocks_backslash() {
     let dest = tempdir().unwrap();
-    let policy = PathPolicy::new(dest.path()).unwrap();
+    let policy = PathPolicy::new(dest.path(), false).unwrap();
     let state = default_state();
 
     let entry = file_info("folder\\file.txt", 100);
@@ -90,7 +90,7 @@ fn test_path_policy_blocks_backslash() {
 #[test]
 fn test_path_policy_blocks_empty_name() {
     let dest = tempdir().unwrap();
-    let policy = PathPolicy::new(dest.path()).unwrap();
+    let policy = PathPolicy::new(dest.path(), false).unwrap();
     let state = default_state();
 
     let entry = file_info("", 100);
@@ -101,7 +101,7 @@ fn test_path_policy_blocks_empty_name() {
 #[test]
 fn test_path_policy_blocks_control_chars() {
     let dest = tempdir().unwrap();
-    let policy = PathPolicy::new(dest.path()).unwrap();
+    let policy = PathPolicy::new(dest.path(), false).unwrap();
     let state = default_state();
 
     let entry = file_info("file\x00.txt", 100);
@@ -259,7 +259,7 @@ fn test_policy_chain_empty() {
 #[test]
 fn test_policy_chain_single_policy() {
     let dest = tempdir().unwrap();
-    let chain = PolicyChain::new().with(PathPolicy::new(dest.path()).unwrap());
+    let chain = PolicyChain::new().with(PathPolicy::new(dest.path(), false).unwrap());
     let state = default_state();
 
     let entry = file_info("../escape.txt", 100);
@@ -271,7 +271,7 @@ fn test_policy_chain_single_policy() {
 fn test_policy_chain_multiple_policies() {
     let dest = tempdir().unwrap();
     let chain = PolicyChain::new()
-        .with(PathPolicy::new(dest.path()).unwrap())
+        .with(PathPolicy::new(dest.path(), false).unwrap())
         .with(SizePolicy::new(100, 1000))
         .with(CountPolicy::new(10));
     let state = default_state();
@@ -348,7 +348,7 @@ fn test_policy_config_symlink_error() {
 fn test_directory_entry_validation() {
     let dest = tempdir().unwrap();
     let chain = PolicyChain::new()
-        .with(PathPolicy::new(dest.path()).unwrap())
+        .with(PathPolicy::new(dest.path(), false).unwrap())
         .with(DepthPolicy::new(3));
     let state = default_state();
 
@@ -381,4 +381,22 @@ fn test_cumulative_state_tracking() {
     let entry = file_info("file3.txt", 200);
     let result = policy.check(&entry, &state);
     assert!(matches!(result, Err(Error::TotalSizeExceeded { .. })));
+}
+
+#[test]
+fn test_path_policy_with_junk_paths() {
+    let dest = tempdir().unwrap();
+
+    // 1. Test normal mode (should fail on traverse)
+    let strict_policy = PathPolicy::new(dest.path(), false).unwrap();
+    let state = default_state();
+    let bad_entry = file_info("../../etc/passwd", 100);
+
+    let result = strict_policy.check(&bad_entry, &state);
+    assert!(matches!(result, Err(Error::PathEscape { .. })));
+
+    // 2. Test junk_paths mode (should pass traverse because it will be flattened later)
+    let loose_policy = PathPolicy::new(dest.path(), true).unwrap();
+    let result2 = loose_policy.check(&bad_entry, &state);
+    assert!(result2.is_ok());
 }

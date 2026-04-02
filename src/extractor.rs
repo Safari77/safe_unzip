@@ -1,9 +1,14 @@
 use crate::error::Error;
 use crate::limits::Limits;
-use path_jail::Jail;
+use camino::Utf8Path;
+use cap_std::ambient_authority;
+use cap_std::fs_utf8::{Dir, OpenOptions};
 use std::fs;
 use std::io::{Read, Seek, Write};
 use std::path::{Component, Path};
+
+#[cfg(unix)]
+use cap_std::fs::PermissionsExt;
 
 /// What to do when a file already exists at the extraction path.
 ///
@@ -21,6 +26,10 @@ pub enum OverwritePolicy {
     Skip,
     /// Overwrite existing files. Symlinks are removed before overwriting (security).
     Overwrite,
+    /// Rename file.ext to file.1.ext
+    RenameBase,
+    /// Rename file.ext to file.ext.1
+    RenameExt,
 }
 
 /// What to do with symlinks in the archive.
@@ -84,6 +93,7 @@ pub struct Report {
     pub dirs_created: usize,
     pub bytes_written: u64,
     pub entries_skipped: usize,
+    pub renames: Vec<(String, String)>,
 }
 
 /// Report returned by `verify()`.
@@ -121,8 +131,7 @@ pub struct Progress {
 }
 
 pub struct Extractor {
-    root: std::path::PathBuf,
-    jail: Jail,
+    dir: Dir,
     limits: Limits,
     overwrite: OverwritePolicy,
     symlinks: SymlinkPolicy,
@@ -183,7 +192,7 @@ impl Extractor {
     fn new_impl(destination: &Path, create: bool) -> Result<Self, Error> {
         if !destination.exists() {
             if create {
-                fs::create_dir_all(destination)?;
+                std::fs::create_dir_all(destination)?;
             } else {
                 return Err(Error::DestinationNotFound {
                     path: destination.to_string_lossy().to_string(),
@@ -191,10 +200,16 @@ impl Extractor {
             }
         }
 
-        let jail = Jail::new(destination)?;
+        let utf8_dest =
+            Utf8Path::from_path(destination).ok_or_else(|| Error::DestinationNotFound {
+                path: destination.to_string_lossy().to_string(),
+            })?;
+        // Securely open the destination directory holding a file descriptor
+        let dir =
+            Dir::open_ambient_dir(utf8_dest, ambient_authority()).map_err(Error::Io)?;
+
         Ok(Self {
-            root: destination.to_path_buf(),
-            jail,
+            dir,
             limits: Limits::default(),
             overwrite: OverwritePolicy::default(),
             symlinks: SymlinkPolicy::default(),
@@ -409,28 +424,18 @@ impl Extractor {
                 });
             }
 
-            // 1. SECURITY: Path Validation (Path Jail)
-            // We check this FIRST to ensure the path is safe (doesn't escape root).
-            // NOTE: We discard the returned path because Jail might resolve symlinks (e.g. on overwrite),
-            // which causes us to overwrite the target instead of the symlink.
-            // We construct the path manually relative to root, which is safe because Jail verified it.
-            let _ = self.jail.join(&name).map_err(|e| Error::PathEscape {
-                entry: name.clone(),
-                detail: e.to_string(),
-            })?;
-
-            // 1. Modified Path Resolution (Junk Paths)
-            let safe_path = if self.junk_paths {
-                let filename =
-                    Path::new(&name)
-                        .file_name()
-                        .ok_or_else(|| Error::InvalidFilename {
-                            entry: name.clone(),
-                            reason: "entry has no filename".to_string(),
-                        })?;
-                self.root.join(filename)
+            // 1. Modified Path Resolution
+            let safe_relative_path = if self.junk_paths {
+                Path::new(&name)
+                    .file_name()
+                    .ok_or_else(|| Error::InvalidFilename {
+                        entry: name.clone(),
+                        reason: "entry has no filename".to_string(),
+                    })?
+                    .to_string_lossy()
+                    .into_owned()
             } else {
-                self.root.join(&name)
+                name.clone()
             };
 
             // 2. CHECK: Symlinks
@@ -478,12 +483,11 @@ impl Extractor {
                 is_symlink: entry.is_symlink(),
             };
 
-            if let Some(ref filter) = self.filter {
-                if !filter(&info) {
+            if let Some(ref filter) = self.filter
+                && !filter(&info) {
                     report.entries_skipped += 1;
                     continue;
                 }
-            }
 
             // 5. CHECK: Limits (Count & Lookahead Total)
             // Check file count
@@ -514,50 +518,46 @@ impl Extractor {
 
             // 7. EXECUTION
             if entry.is_dir() {
-                fs::create_dir_all(&safe_path)?;
+                if let Err(e) = self.dir.create_dir_all(&safe_relative_path) {
+                    // map errors if cap-std blocks traversal
+                    return Err(Error::Io(e));
+                }
                 report.dirs_created += 1;
-
                 #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Some(mode) = self.dir_mode.or_else(|| entry.unix_mode()) {
-                        let safe_mode = mode & 0o0777;
-                        fs::set_permissions(&safe_path, fs::Permissions::from_mode(safe_mode))?;
-                    }
+                if let Some(mode) = self.dir_mode.or_else(|| entry.unix_mode()) {
+                    let safe_mode = mode & 0o0777;
+                    self.dir.set_permissions(
+                        &safe_relative_path,
+                        cap_std::fs::Permissions::from_mode(safe_mode),
+                    )?;
                 }
             } else {
-                if !self.junk_paths {
-                    if let Some(parent) = safe_path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                }
+                if !self.junk_paths
+                    && let Some(parent) = camino::Utf8Path::new(&safe_relative_path).parent()
+                        && !parent.as_str().is_empty() {
+                            self.dir.create_dir_all(parent)?;
+                        }
 
-                // SECURITY: Atomic file creation based on overwrite policy
-                // Using create_new(true) eliminates TOCTOU race conditions
+                // SECURITY: Atomic file creation based on overwrite policy utilizing openat2 under the hood
+                let mut actual_path = safe_relative_path.clone();
                 let outfile = match self.overwrite {
                     OverwritePolicy::Error => {
-                        // create_new(true) is atomic: fails if file exists (no TOCTOU)
-                        match fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(&safe_path)
-                        {
+                        match self.dir.open_with(
+                            &actual_path,
+                            OpenOptions::new().write(true).create_new(true),
+                        ) {
                             Ok(f) => f,
                             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                                return Err(Error::AlreadyExists {
-                                    entry: safe_path.display().to_string(),
-                                });
+                                return Err(Error::AlreadyExists { entry: actual_path });
                             }
                             Err(e) => return Err(Error::Io(e)),
                         }
                     }
                     OverwritePolicy::Skip => {
-                        // Try atomic create, skip on exists
-                        match fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(&safe_path)
-                        {
+                        match self.dir.open_with(
+                            &actual_path,
+                            OpenOptions::new().write(true).create_new(true),
+                        ) {
                             Ok(f) => f,
                             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                                 report.entries_skipped += 1;
@@ -567,14 +567,57 @@ impl Extractor {
                         }
                     }
                     OverwritePolicy::Overwrite => {
-                        // SECURITY: Remove any existing symlink first to prevent following
-                        if let Ok(m) = fs::symlink_metadata(&safe_path) {
-                            if m.file_type().is_symlink() {
-                                let _ = fs::remove_file(&safe_path);
+                        if let Ok(m) = self.dir.symlink_metadata(&actual_path)
+                            && m.file_type().is_symlink() {
+                                let _ = self.dir.remove_file(&actual_path);
+                            }
+                        self.dir.create(&actual_path)?
+                    }
+                    OverwritePolicy::RenameBase | OverwritePolicy::RenameExt => {
+                        let mut i = 1;
+                        loop {
+                            match self.dir.open_with(
+                                &actual_path,
+                                OpenOptions::new().write(true).create_new(true),
+                            ) {
+                                Ok(f) => break f,
+                                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                                    let utf8_path = camino::Utf8Path::new(&safe_relative_path);
+                                    let parent =
+                                        utf8_path.parent().unwrap_or(camino::Utf8Path::new(""));
+                                    let new_name =
+                                        if matches!(self.overwrite, OverwritePolicy::RenameExt) {
+                                            format!(
+                                                "{}.{}",
+                                                utf8_path.file_name().unwrap_or("file"),
+                                                i
+                                            )
+                                        } else {
+                                            if let Some(ext) = utf8_path.extension() {
+                                                format!(
+                                                    "{}_{}.{}",
+                                                    utf8_path.file_stem().unwrap(),
+                                                    i,
+                                                    ext
+                                                )
+                                            } else {
+                                                format!(
+                                                    "{}_{}",
+                                                    utf8_path.file_name().unwrap_or("file"),
+                                                    i
+                                                )
+                                            }
+                                        };
+                                    actual_path = if parent.as_str().is_empty() {
+                                        new_name
+                                    } else {
+                                        parent.join(new_name).into_string()
+                                    };
+                                    i += 1;
+                                }
+                                Err(e) => return Err(Error::Io(e)),
                             }
                         }
-                        // Now create/truncate
-                        fs::File::create(&safe_path)?
                     }
                 };
 
@@ -664,16 +707,19 @@ impl Extractor {
                 report.bytes_written += written;
                 report.files_extracted += 1;
 
-                // Handle permissions on Unix
                 #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Some(mode) = self.file_mode.or_else(|| entry.unix_mode()) {
-                        // Strip setuid (0o4000), setgid (0o2000), sticky (0o1000) bits
-                        // 0o0777 mask keeps only owner/group/other rwx flags
-                        let safe_mode = mode & 0o0777;
-                        fs::set_permissions(&safe_path, fs::Permissions::from_mode(safe_mode))?;
-                    }
+                if let Some(mode) = self.file_mode.or_else(|| entry.unix_mode()) {
+                    let safe_mode = mode & 0o0777;
+                    self.dir.set_permissions(
+                        &actual_path,
+                        cap_std::fs::Permissions::from_mode(safe_mode),
+                    )?;
+                }
+
+                if actual_path != safe_relative_path {
+                    report
+                        .renames
+                        .push((safe_relative_path.clone(), actual_path.clone()));
                 }
             }
         }
@@ -708,11 +754,19 @@ impl Extractor {
                 });
             }
 
-            // 1. Path validation (Zip Slip check)
-            self.jail.join(&name).map_err(|e| Error::PathEscape {
-                entry: name.clone(),
-                detail: e.to_string(),
-            })?;
+            // 1. Path validation (Zip Slip early check)
+            let path = Path::new(&name);
+            for comp in path.components() {
+                if matches!(
+                    comp,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                ) {
+                    return Err(Error::PathEscape {
+                        entry: name.clone(),
+                        detail: "Invalid path component detected".to_string(),
+                    });
+                }
+            }
 
             // 2. Symlink check
             if entry.is_symlink() && matches!(self.symlinks, SymlinkPolicy::Error) {
@@ -889,8 +943,8 @@ impl Extractor {
         // Check path components for reserved names
         let path = Path::new(name);
         for component in path.components() {
-            if let Component::Normal(os_str) = component {
-                if let Some(s) = os_str.to_str() {
+            if let Component::Normal(os_str) = component
+                && let Some(s) = os_str.to_str() {
                     // Windows reserved names
                     let s_upper = s.to_ascii_uppercase();
                     let file_stem = s_upper.split('.').next().unwrap_or(&s_upper);
@@ -904,7 +958,6 @@ impl Extractor {
                         _ => {}
                     }
                 }
-            }
         }
         Ok(())
     }

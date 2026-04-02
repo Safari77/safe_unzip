@@ -1,7 +1,7 @@
 [package]
 name = "safe_unzip"
 version = "0.2.0"
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Safari77/safe_unzip"
 # Forked from https://github.com/tenuo-ai/safe_unzip
@@ -9,6 +9,7 @@ authors = ["Sami Farin"]
 description = "Secure zip extraction. Prevents Zip Slip and Zip Bombs."
 keywords = ["zip", "security", "archive", "extraction", "safe"]
 categories = ["filesystem", "compression"]
+publish = false
 
 [workspace]
 members = [".", "python"]
@@ -26,7 +27,8 @@ path = "src/bin/cli.rs"
 required-features = ["cli"]
 
 [dependencies]
-path_jail = { git = "https://github.com/Safari77/path_jail", features = ["secure-open"] }
+cap-std = { version = "4", features = ["fs_utf8"] }
+camino = "1"
 clap = { version = "4", features = ["derive"], optional = true }
 clap_complete = { version = "4", optional = true }
 zip = { version = "8", default-features = false, features = ["deflate", "deflate64", "lzma", "time", "chrono", "aes-crypto"] }
@@ -57,3 +59,7 @@ opt-level = 1
 lto = false
 debug = true
 strip = false
+
+[patch.crates-io]
+deflate64 = { path = "../deflate64-rs" }
+

@@ -3,9 +3,14 @@
 //! The driver orchestrates extraction using adapters (format-specific) and
 //! policies (security checks).
 
-use std::fs;
+use camino::Utf8Path;
+use cap_std::ambient_authority;
+use cap_std::fs_utf8::{Dir, OpenOptions};
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use cap_std::fs::PermissionsExt;
 
 #[cfg(feature = "tar")]
 use crate::adapter::TarAdapter;
@@ -29,6 +34,10 @@ pub enum OverwriteMode {
     Skip,
     /// Overwrite existing files. Symlinks are removed before overwriting.
     Overwrite,
+    /// If exists, rename file.ext to file_1.ext
+    RenameBase,
+    /// If exists, rename file.ext to file.ext.1
+    RenameExt,
 }
 
 /// Extraction mode determining validation strategy.
@@ -52,6 +61,8 @@ pub struct ExtractionReport {
     pub bytes_written: u64,
     /// Number of entries skipped (symlinks, filtered, existing).
     pub entries_skipped: usize,
+    /// Renamed files
+    pub renames: Vec<(String, String)>,
 }
 
 /// Generic extraction driver that works with any archive format.
@@ -71,6 +82,8 @@ pub struct ExtractionReport {
 pub struct Driver {
     /// Destination directory.
     destination: PathBuf,
+    /// For secure openat2 operations
+    dir: Dir,
     /// Security limits.
     limits: Limits,
     /// What to do on existing files.
@@ -103,10 +116,45 @@ impl Driver {
         Self::new_impl(destination.as_ref(), true)
     }
 
+    /// Handles file creation for RenameBase and RenameExt policies.
+    fn open_with_rename(&self, path: &str) -> Result<(cap_std::fs_utf8::File, String), Error> {
+        let mut i = 1;
+        let mut current_path = path.to_string();
+        loop {
+            match self.dir.open_with(
+                &current_path,
+                OpenOptions::new().write(true).create_new(true),
+            ) {
+                Ok(f) => return Ok((f, current_path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Always base the new name on the original path
+                    let utf8_path = camino::Utf8Path::new(path);
+                    let parent = utf8_path.parent().unwrap_or(camino::Utf8Path::new(""));
+                    let new_name = if matches!(self.overwrite, OverwriteMode::RenameExt) {
+                        format!("{}.{}", utf8_path.file_name().unwrap_or("file"), i)
+                    } else {
+                        if let Some(ext) = utf8_path.extension() {
+                            format!("{}_{}.{}", utf8_path.file_stem().unwrap(), i, ext)
+                        } else {
+                            format!("{}_{}", utf8_path.file_name().unwrap_or("file"), i)
+                        }
+                    };
+                    current_path = if parent.as_str().is_empty() {
+                        new_name
+                    } else {
+                        parent.join(new_name).into_string()
+                    };
+                    i += 1;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
     fn new_impl(destination: &Path, create: bool) -> Result<Self, Error> {
         if !destination.exists() {
             if create {
-                fs::create_dir_all(destination)?;
+                std::fs::create_dir_all(destination)?;
             } else {
                 return Err(Error::DestinationNotFound {
                     path: destination.to_string_lossy().to_string(),
@@ -114,8 +162,16 @@ impl Driver {
             }
         }
 
+        let utf8_dest =
+            Utf8Path::from_path(destination).ok_or_else(|| Error::DestinationNotFound {
+                path: destination.to_string_lossy().to_string(),
+            })?;
+
+        let dir = Dir::open_ambient_dir(utf8_dest, ambient_authority()).map_err(Error::Io)?;
+
         Ok(Self {
             destination: destination.to_path_buf(),
+            dir,
             limits: Limits::default(),
             overwrite: OverwriteMode::default(),
             symlinks: SymlinkBehavior::default(),
@@ -190,13 +246,16 @@ impl Driver {
         self
     }
 
-    // Updated extraction logic (applied across all adapters)
-    fn resolve_path(&self, name: &str) -> PathBuf {
+    // Resolves path explicitly as a relative String for fs_utf8 compatibility
+    fn resolve_path(&self, name: &str) -> String {
         if self.junk_paths {
-            let filename = Path::new(name).file_name().unwrap_or_default();
-            self.destination.join(filename)
+            Path::new(name)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
         } else {
-            self.destination.join(name)
+            name.to_owned()
         }
     }
 
@@ -204,21 +263,33 @@ impl Driver {
     #[cfg(unix)]
     fn apply_permissions(
         &self,
-        path: &Path,
+        path: &str,
         info_mode: Option<u32>,
         is_dir: bool,
     ) -> Result<(), Error> {
-        use std::os::unix::fs::PermissionsExt;
         let override_mode = if is_dir {
             self.dir_mode
         } else {
             self.file_mode
         };
 
+        #[cfg(unix)]
         if let Some(mode) = override_mode.or(info_mode) {
             let safe_mode = mode & 0o0777;
-            fs::set_permissions(path, fs::Permissions::from_mode(safe_mode))?;
+            self.dir
+                .set_permissions(path, cap_std::fs::Permissions::from_mode(safe_mode))?;
         }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn apply_permissions(
+        &self,
+        _path: &str, // Prefix with underscore to silence unused warning
+        _info_mode: Option<u32>,
+        _is_dir: bool,
+    ) -> Result<(), Error> {
+        // File permissions like 0o755 don't translate directly to Windows natively in std/cap-std.
         Ok(())
     }
 
@@ -290,7 +361,7 @@ impl Driver {
     /// Build the policy chain from current settings.
     fn build_policies(&self) -> Result<PolicyChain, Error> {
         Ok(PolicyChain::new()
-            .with(PathPolicy::new(&self.destination)?)
+            .with(PathPolicy::new(&self.destination, self.junk_paths)?)
             .with(SizePolicy::new(
                 self.limits.max_single_file,
                 self.limits.max_total_bytes,
@@ -323,6 +394,7 @@ impl Driver {
             dirs_created: state.dirs_created,
             bytes_written: state.bytes_written,
             entries_skipped: state.entries_skipped,
+            renames: state.renames,
         })
     }
 
@@ -359,12 +431,11 @@ impl Driver {
         let info = adapter.entry_info(index)?;
 
         // Apply filter
-        if let Some(ref filter) = self.filter {
-            if !filter(&info) {
+        if let Some(ref filter) = self.filter
+            && !filter(&info) {
                 state.entries_skipped += 1;
                 return Ok(());
             }
-        }
 
         // Check policies
         policies.check_all(&info, state)?;
@@ -387,41 +458,36 @@ impl Driver {
         match info.kind {
             EntryKind::Directory => {
                 // For directories, just create (idempotent)
-                fs::create_dir_all(&safe_path)?;
+                self.dir.create_dir_all(&safe_path)?;
                 state.dirs_created += 1;
             }
             EntryKind::File => {
-                if !self.junk_paths {
-                    if let Some(parent) = safe_path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                }
+                if !self.junk_paths
+                    && let Some(parent) = camino::Utf8Path::new(&safe_path).parent()
+                        && !parent.as_str().is_empty() {
+                            self.dir.create_dir_all(parent)?;
+                        }
 
                 // Atomic file creation based on overwrite mode
+                let mut actual_path = safe_path.clone();
                 let outfile = match self.overwrite {
                     OverwriteMode::Error => {
-                        // create_new(true) is atomic: fails if file exists (no TOCTOU)
-                        match fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(&safe_path)
-                        {
+                        match self.dir.open_with(
+                            &actual_path,
+                            OpenOptions::new().write(true).create_new(true),
+                        ) {
                             Ok(f) => f,
                             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                                return Err(Error::AlreadyExists {
-                                    entry: safe_path.display().to_string(),
-                                });
+                                return Err(Error::AlreadyExists { entry: actual_path });
                             }
                             Err(e) => return Err(e.into()),
                         }
                     }
                     OverwriteMode::Skip => {
-                        // Try atomic create, skip on exists
-                        match fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(&safe_path)
-                        {
+                        match self.dir.open_with(
+                            &actual_path,
+                            OpenOptions::new().write(true).create_new(true),
+                        ) {
                             Ok(f) => f,
                             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                                 state.entries_skipped += 1;
@@ -431,14 +497,16 @@ impl Driver {
                         }
                     }
                     OverwriteMode::Overwrite => {
-                        // SECURITY: Remove any existing symlink first to prevent following
-                        if let Ok(m) = fs::symlink_metadata(&safe_path) {
-                            if m.file_type().is_symlink() {
-                                let _ = fs::remove_file(&safe_path);
+                        if let Ok(m) = self.dir.symlink_metadata(&actual_path)
+                            && m.file_type().is_symlink() {
+                                let _ = self.dir.remove_file(&actual_path);
                             }
-                        }
-                        // Now create/truncate
-                        fs::File::create(&safe_path)?
+                        self.dir.create(&actual_path)?
+                    }
+                    OverwriteMode::RenameBase | OverwriteMode::RenameExt => {
+                        let (f, new_path) = self.open_with_rename(&actual_path)?;
+                        actual_path = new_path;
+                        f
                     }
                 };
 
@@ -453,8 +521,15 @@ impl Driver {
                 if self.fsync {
                     outfile.sync_all()?;
                 }
-                self.apply_permissions(&safe_path, info.mode, false)?;
 
+                #[cfg(unix)]
+                {
+                    self.apply_permissions(&actual_path, info.mode, false)?;
+                }
+
+                if actual_path != safe_path {
+                    state.renames.push((safe_path.clone(), actual_path.clone()));
+                }
                 state.bytes_written += written;
                 state.files_extracted += 1;
             }
@@ -528,6 +603,7 @@ impl Driver {
                 dirs_created: state.dirs_created,
                 bytes_written: state.bytes_written,
                 entries_skipped: state.entries_skipped,
+                renames: state.renames,
             });
         }
 
@@ -557,6 +633,7 @@ impl Driver {
             dirs_created: state.dirs_created,
             bytes_written: state.bytes_written,
             entries_skipped: state.entries_skipped,
+            renames: state.renames,
         })
     }
 
@@ -570,12 +647,11 @@ impl Driver {
         state: &mut ExtractionState,
     ) -> Result<(), Error> {
         // Apply filter
-        if let Some(ref filter) = self.filter {
-            if !filter(info) {
+        if let Some(ref filter) = self.filter
+            && !filter(info) {
                 state.entries_skipped += 1;
                 return Ok(());
             }
-        }
 
         // Check policies
         policies.check_all(info, state)?;
@@ -595,21 +671,24 @@ impl Driver {
 
         match info.kind {
             EntryKind::Directory => {
-                fs::create_dir_all(&safe_path)?;
+                self.dir.create_dir_all(&safe_path)?;
                 self.apply_permissions(&safe_path, info.mode, true)?;
                 state.dirs_created += 1;
             }
             EntryKind::File => {
-                if !self.junk_paths {
-                    if let Some(parent) = safe_path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                }
+                if !self.junk_paths
+                    && let Some(parent) = camino::Utf8Path::new(&safe_path).parent()
+                        && !parent.as_str().is_empty() {
+                            self.dir.create_dir_all(parent)?;
+                        }
 
-                let outfile = self.open_for_write(&safe_path, state)?;
-                let Some(mut outfile) = outfile else {
+                let outfile_result = self.open_for_write(&safe_path, state)?;
+                let Some((mut outfile, actual_path)) = outfile_result else {
                     return Ok(()); // Skipped
                 };
+                if actual_path != safe_path {
+                    state.renames.push((safe_path.clone(), actual_path.clone()));
+                }
 
                 if let Some(reader) = reader {
                     let limit = self.limits.max_single_file.min(
@@ -624,7 +703,7 @@ impl Driver {
                     state.bytes_written += written;
                 }
 
-                self.apply_permissions(&safe_path, info.mode, false)?;
+                self.apply_permissions(&actual_path, info.mode, false)?;
                 state.files_extracted += 1;
             }
             EntryKind::Symlink { .. } => {
@@ -645,12 +724,11 @@ impl Driver {
         state: &mut ExtractionState,
     ) -> Result<(), Error> {
         // Apply filter
-        if let Some(ref filter) = self.filter {
-            if !filter(info) {
+        if let Some(ref filter) = self.filter
+            && !filter(info) {
                 state.entries_skipped += 1;
                 return Ok(());
             }
-        }
 
         if self.junk_paths && matches!(info.kind, EntryKind::Directory) {
             state.entries_skipped += 1;
@@ -670,19 +748,24 @@ impl Driver {
 
         match info.kind {
             EntryKind::Directory => {
-                fs::create_dir_all(&safe_path)?;
+                self.dir.create_dir_all(&safe_path)?;
                 self.apply_permissions(&safe_path, info.mode, true)?;
                 state.dirs_created += 1;
             }
             EntryKind::File => {
-                if let Some(parent) = safe_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
+                if !self.junk_paths
+                    && let Some(parent) = camino::Utf8Path::new(&safe_path).parent()
+                        && !parent.as_str().is_empty() {
+                            self.dir.create_dir_all(parent)?;
+                        }
 
-                let outfile = self.open_for_write(&safe_path, state)?;
-                let Some(mut outfile) = outfile else {
+                let outfile_result = self.open_for_write(&safe_path, state)?;
+                let Some((mut outfile, actual_path)) = outfile_result else {
                     return Ok(()); // Skipped
                 };
+                if actual_path != safe_path {
+                    state.renames.push((safe_path.clone(), actual_path.clone()));
+                }
 
                 if let Some(data) = data {
                     use std::io::Write;
@@ -693,7 +776,7 @@ impl Driver {
                     state.bytes_written += data.len() as u64;
                 }
 
-                self.apply_permissions(&safe_path, info.mode, false)?;
+                self.apply_permissions(&actual_path, info.mode, false)?;
                 state.files_extracted += 1;
             }
             EntryKind::Symlink { .. } => {
@@ -709,32 +792,30 @@ impl Driver {
     #[cfg(feature = "tar")]
     fn open_for_write(
         &self,
-        path: &Path,
+        path: &str,
         state: &mut ExtractionState,
-    ) -> Result<Option<fs::File>, Error> {
+    ) -> Result<Option<(cap_std::fs_utf8::File, String)>, Error> {
         match self.overwrite {
             OverwriteMode::Error => {
-                match fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(path)
+                match self
+                    .dir
+                    .open_with(path, OpenOptions::new().write(true).create_new(true))
                 {
-                    Ok(f) => Ok(Some(f)),
+                    Ok(f) => Ok(Some((f, path.to_string()))),
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                         Err(Error::AlreadyExists {
-                            entry: path.display().to_string(),
+                            entry: path.to_string(),
                         })
                     }
                     Err(e) => Err(e.into()),
                 }
             }
             OverwriteMode::Skip => {
-                match fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(path)
+                match self
+                    .dir
+                    .open_with(path, OpenOptions::new().write(true).create_new(true))
                 {
-                    Ok(f) => Ok(Some(f)),
+                    Ok(f) => Ok(Some((f, path.to_string()))),
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                         state.entries_skipped += 1;
                         Ok(None)
@@ -743,12 +824,14 @@ impl Driver {
                 }
             }
             OverwriteMode::Overwrite => {
-                if let Ok(m) = fs::symlink_metadata(path) {
-                    if m.file_type().is_symlink() {
-                        let _ = fs::remove_file(path);
+                if let Ok(m) = self.dir.symlink_metadata(path)
+                    && m.file_type().is_symlink() {
+                        let _ = self.dir.remove_file(path);
                     }
-                }
-                Ok(Some(fs::File::create(path)?))
+                Ok(Some((self.dir.create(path)?, path.to_string())))
+            }
+            OverwriteMode::RenameBase | OverwriteMode::RenameExt => {
+                Ok(Some(self.open_with_rename(path)?))
             }
         }
     }
@@ -810,6 +893,7 @@ impl Driver {
             dirs_created: state.dirs_created,
             bytes_written: state.bytes_written,
             entries_skipped: state.entries_skipped,
+            renames: state.renames,
         })
     }
 
@@ -823,12 +907,11 @@ impl Driver {
         state: &mut ExtractionState,
     ) -> Result<(), Error> {
         // Apply filter
-        if let Some(ref filter) = self.filter {
-            if !filter(info) {
+        if let Some(ref filter) = self.filter
+            && !filter(info) {
                 state.entries_skipped += 1;
                 return Ok(());
             }
-        }
 
         // Validate with policies
         policies.check_all(info, state)?;
@@ -842,21 +925,24 @@ impl Driver {
 
         match info.kind {
             EntryKind::Directory => {
-                fs::create_dir_all(&safe_path)?;
+                self.dir.create_dir_all(&safe_path)?;
                 self.apply_permissions(&safe_path, info.mode, true)?;
                 state.dirs_created += 1;
             }
             EntryKind::File => {
-                if !self.junk_paths {
-                    if let Some(parent) = safe_path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                }
+                if !self.junk_paths
+                    && let Some(parent) = camino::Utf8Path::new(&safe_path).parent()
+                        && !parent.as_str().is_empty() {
+                            self.dir.create_dir_all(parent)?;
+                        }
 
-                let outfile = self.open_for_write(&safe_path, state)?;
-                let Some(mut outfile) = outfile else {
+                let outfile_result = self.open_for_write(&safe_path, state)?;
+                let Some((mut outfile, actual_path)) = outfile_result else {
                     return Ok(()); // Skipped
                 };
+                if actual_path != safe_path {
+                    state.renames.push((safe_path.clone(), actual_path.clone()));
+                }
 
                 if let Some(bytes) = data {
                     use std::io::Write;
@@ -867,7 +953,7 @@ impl Driver {
                     state.bytes_written += bytes.len() as u64;
                 }
 
-                self.apply_permissions(&safe_path, info.mode, false)?;
+                self.apply_permissions(&actual_path, info.mode, false)?;
                 state.files_extracted += 1;
             }
             EntryKind::Symlink { .. } => {

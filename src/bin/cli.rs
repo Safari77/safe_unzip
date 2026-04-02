@@ -152,6 +152,10 @@ enum OverwriteMode {
     Skip,
     /// Overwrite existing files
     Overwrite,
+    /// If exists, rename file.ext to file_1.ext
+    RenameBase,
+    /// If exists, rename file.ext to file.ext.1
+    RenameExt,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -262,8 +266,7 @@ fn run(mut cli: Cli) -> Result<(), Error> {
     }
 
     if error_count > 0 {
-        Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        Err(Error::Io(std::io::Error::other(
             "One or more archives failed to process",
         )))
     } else {
@@ -302,6 +305,8 @@ fn process_archive(cli: &mut Cli, archive: &Path) -> Result<(), Error> {
         OverwriteMode::Error => OverwritePolicy::Error,
         OverwriteMode::Skip => OverwritePolicy::Skip,
         OverwriteMode::Overwrite => OverwritePolicy::Overwrite,
+        OverwriteMode::RenameBase => OverwritePolicy::RenameBase,
+        OverwriteMode::RenameExt => OverwritePolicy::RenameExt,
     };
 
     let symlinks = match cli.symlinks {
@@ -317,14 +322,14 @@ fn process_archive(cli: &mut Cli, archive: &Path) -> Result<(), Error> {
 
     // Build extractor based on format
     match format {
-        ArchiveFormat::Zip => extract_zip(&cli, archive, limits, overwrite, symlinks, mode),
+        ArchiveFormat::Zip => extract_zip(cli, archive, limits, overwrite, symlinks, mode),
         ArchiveFormat::Tar | ArchiveFormat::TarGz => {
-            extract_tar(&cli, archive, format, limits, overwrite, symlinks, mode)
+            extract_tar(cli, archive, format, limits, overwrite, symlinks, mode)
         }
         ArchiveFormat::SevenZ => {
             #[cfg(feature = "sevenz")]
             {
-                extract_sevenz(&cli, archive, limits, overwrite, symlinks, mode)
+                extract_sevenz(cli, archive, limits, overwrite, symlinks, mode)
             }
             #[cfg(not(feature = "sevenz"))]
             {
@@ -394,6 +399,12 @@ fn extract_zip(
             format_bytes(report.bytes_written),
             cli.dest.display()
         );
+        if !report.renames.is_empty() {
+            println!("\nThe following files were renamed to avoid overwriting:");
+            for (orig, new) in report.renames {
+                println!("  {} -> {}", orig, new);
+            }
+        }
         if report.entries_skipped > 0 {
             println!("Skipped {} entries", report.entries_skipped);
         }
@@ -415,6 +426,8 @@ fn extract_tar(
         OverwritePolicy::Error => safe_unzip::OverwriteMode::Error,
         OverwritePolicy::Skip => safe_unzip::OverwriteMode::Skip,
         OverwritePolicy::Overwrite => safe_unzip::OverwriteMode::Overwrite,
+        OverwritePolicy::RenameBase => safe_unzip::OverwriteMode::RenameBase,
+        OverwritePolicy::RenameExt => safe_unzip::OverwriteMode::RenameExt,
     };
 
     let symlink_behavior = match symlinks {
@@ -488,6 +501,12 @@ fn extract_tar(
             format_bytes(report.bytes_written),
             cli.dest.display()
         );
+        if !report.renames.is_empty() {
+            println!("\nThe following files were renamed to avoid overwriting:");
+            for (orig, new) in report.renames {
+                println!("  {} -> {}", orig, new);
+            }
+        }
         if report.entries_skipped > 0 {
             println!("Skipped {} entries", report.entries_skipped);
         }
@@ -510,6 +529,8 @@ fn extract_sevenz(
         OverwritePolicy::Error => safe_unzip::OverwriteMode::Error,
         OverwritePolicy::Skip => safe_unzip::OverwriteMode::Skip,
         OverwritePolicy::Overwrite => safe_unzip::OverwriteMode::Overwrite,
+        OverwritePolicy::RenameBase => safe_unzip::OverwriteMode::RenameBase,
+        OverwritePolicy::RenameExt => safe_unzip::OverwriteMode::RenameExt,
     };
 
     let symlink_behavior = match symlinks {
@@ -562,6 +583,12 @@ fn extract_sevenz(
             format_bytes(report.bytes_written),
             cli.dest.display()
         );
+        if !report.renames.is_empty() {
+            println!("\nThe following files were renamed to avoid overwriting:");
+            for (orig, new) in report.renames {
+                println!("  {} -> {}", orig, new);
+            }
+        }
         if report.entries_skipped > 0 {
             println!("Skipped {} entries", report.entries_skipped);
         }
@@ -824,8 +851,8 @@ fn resolve_password(archive: &Path, format: &ArchiveFormat, verbose: bool) -> Op
 fn requires_password(path: &Path, format: &ArchiveFormat) -> bool {
     match format {
         ArchiveFormat::Zip => {
-            if let Ok(file) = std::fs::File::open(path) {
-                if let Ok(mut archive) = zip::ZipArchive::new(file) {
+            if let Ok(file) = std::fs::File::open(path)
+                && let Ok(mut archive) = zip::ZipArchive::new(file) {
                     for i in 0..archive.len() {
                         let is_encrypted = if let Ok(entry) = archive.by_index_raw(i) {
                             entry.encrypted()
@@ -837,7 +864,6 @@ fn requires_password(path: &Path, format: &ArchiveFormat) -> bool {
                         }
                     }
                 }
-            }
             false
         }
         // For other formats, assume password might be needed if prompted,
@@ -849,8 +875,8 @@ fn requires_password(path: &Path, format: &ArchiveFormat) -> bool {
 fn verify_password(path: &Path, format: &ArchiveFormat, password: &str) -> bool {
     match format {
         ArchiveFormat::Zip => {
-            if let Ok(file) = std::fs::File::open(path) {
-                if let Ok(mut archive) = zip::ZipArchive::new(file) {
+            if let Ok(file) = std::fs::File::open(path)
+                && let Ok(mut archive) = zip::ZipArchive::new(file) {
                     // Try to find an encrypted entry and decrypt it
                     for i in 0..archive.len() {
                         let is_encrypted = if let Ok(entry) = archive.by_index_raw(i) {
@@ -865,7 +891,6 @@ fn verify_password(path: &Path, format: &ArchiveFormat, password: &str) -> bool 
                         }
                     }
                 }
-            }
             false
         }
         ArchiveFormat::SevenZ => {
@@ -936,11 +961,10 @@ fn load_config_passwords(verbose: bool) -> Option<Vec<String>> {
             Ok(content) => match toml::from_str::<Config>(&content) {
                 Ok(config) => {
                     if let Some(passwords_config) = config.passwords {
-                        if let Some(ref list) = passwords_config.list {
-                            if verbose {
+                        if let Some(ref list) = passwords_config.list
+                            && verbose {
                                 println!("Loaded {} passwords from config", list.len());
                             }
-                        }
                         return passwords_config.list;
                     }
                 }

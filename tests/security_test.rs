@@ -65,6 +65,9 @@ fn test_blocks_zip_slip() {
             println!("✅ Successfully blocked traversal: {}", entry);
             assert_eq!(entry, "../../evil.txt");
         }
+        Err(Error::Io(e)) if e.to_string().contains("outside of the filesystem") => {
+            println!("✅ Successfully blocked traversal via cap-std OS layer");
+        }
         Ok(_) => panic!("❌ SECURITY FAIL: Malicious file was extracted!"),
         Err(e) => panic!("❌ Unexpected error type: {:?}", e),
     }
@@ -626,6 +629,9 @@ fn test_absolute_path_rejection() {
         Err(Error::InvalidFilename { .. }) => {
             // Backslash rejection on Windows path
             println!("✅ Blocked absolute path via InvalidFilename");
+        }
+        Err(Error::Io(e)) if e.to_string().contains("outside of the filesystem") => {
+            println!("✅ Blocked absolute path via cap-std OS layer");
         }
         Ok(_) => {
             // If it succeeded, ensure it didn't write outside the jail
@@ -1596,6 +1602,9 @@ fn test_dot_and_dotdot_entries() {
         Err(Error::PathEscape { .. }) | Err(Error::InvalidFilename { .. }) => {
             println!("✅ Single '..' entry rejected");
         }
+        Err(Error::Io(e)) if e.to_string().contains("outside of the filesystem") => {
+            println!("✅ Single '..' entry rejected via cap-std OS layer");
+        }
         Ok(_) => {
             // If it succeeded, must NOT have escaped
             let _parent_exists = dest.path().parent().unwrap().join("..").exists();
@@ -1666,5 +1675,83 @@ fn test_extreme_path_depth() {
         }
         Err(e) => panic!("Expected PathTooDeep, got: {:?}", e),
         Ok(_) => panic!("❌ Should reject 100-level deep path with limit 50"),
+    }
+}
+
+/// Test: Invalid UTF-8 in filename
+/// Attack: Archive contains raw bytes in the filename that are not valid UTF-8
+/// Defense: Should be rejected by parser, or gracefully converted to valid UTF-8
+/// (via lossy replacement or legacy CP437 fallback)
+#[test]
+fn test_invalid_utf8_filename() {
+    let dest = tempdir().unwrap();
+
+    let file = tempfile::tempfile().unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options: FileOptions<()> =
+        FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+    // We use a filename with a Unicode character ("Ü") to force the zip crate
+    // to set the UTF-8 General Purpose Bit Flag (Bit 11).
+    zip.start_file("UÜBB.txt", options).unwrap();
+    zip.write_all(b"data").unwrap();
+    let mut finalized = zip.finish().unwrap();
+
+    finalized.seek(std::io::SeekFrom::Start(0)).unwrap();
+    let mut buffer = Vec::new();
+    use std::io::Read;
+    finalized.read_to_end(&mut buffer).unwrap();
+
+    let target = "UÜBB.txt".as_bytes();
+    // Replace the first 5 bytes with blatantly invalid UTF-8 bytes
+    let invalid_utf8 = [0xFF, 0xFE, 0xFD, 0xFC, 0xFB, b'.', b't', b'x', b't'];
+    assert_eq!(target.len(), invalid_utf8.len());
+
+    let mut replaced = false;
+    for i in 0..buffer.len().saturating_sub(target.len()) {
+        if &buffer[i..i + target.len()] == target {
+            buffer[i..i + target.len()].copy_from_slice(&invalid_utf8);
+            replaced = true;
+        }
+    }
+    assert!(replaced, "Failed to hack the zip file");
+
+    let mut hacked_file = tempfile::tempfile().unwrap();
+    use std::io::Write;
+    hacked_file.write_all(&buffer).unwrap();
+    hacked_file.seek(std::io::SeekFrom::Start(0)).unwrap();
+
+    let result = safe_unzip::Extractor::new(dest.path())
+        .unwrap()
+        .extract(hacked_file);
+
+    match result {
+        Err(safe_unzip::Error::InvalidFilename { reason, .. }) => {
+            println!("✅ Rejected invalid UTF-8: {}", reason);
+        }
+        Err(safe_unzip::Error::Zip(_)) | Err(safe_unzip::Error::Io(_)) => {
+            println!("✅ Zip crate or OS rejected invalid UTF-8 at parse time");
+        }
+        Ok(report) => {
+            assert_eq!(report.files_extracted, 1);
+
+            // Dynamically find the file to see how it was decoded
+            let mut entries = std::fs::read_dir(dest.path()).unwrap();
+            let extracted_file = entries.next().expect("File MUST exist").unwrap();
+            let actual_name = extracted_file.file_name().to_string_lossy().into_owned();
+
+            // If the adapter performed CP437 fallback or lossy conversion,
+            // it safely became valid UTF-8 without crashing the extractor.
+            println!(
+                "⚠️ Invalid UTF-8 was safely converted to valid UTF-8 string: {}",
+                actual_name
+            );
+
+            assert!(
+                actual_name.ends_with(".txt"),
+                "Filename should still end with .txt"
+            );
+        }
+        Err(e) => panic!("❌ Unexpected error: {:?}", e),
     }
 }

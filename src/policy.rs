@@ -5,8 +5,6 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use path_jail::Jail;
-
 use crate::entry::{EntryInfo, EntryKind};
 use crate::error::Error;
 
@@ -21,6 +19,8 @@ pub struct ExtractionState {
     pub bytes_written: u64,
     /// Entries skipped (symlinks, filtered, etc.).
     pub entries_skipped: usize,
+    /// Tracking renames with --overwrite rename-{base,ext}
+    pub renames: Vec<(String, String)>,
 }
 
 /// A security policy that validates entries before extraction.
@@ -71,17 +71,12 @@ impl Default for PolicyChain {
 
 /// Policy that prevents path traversal attacks (Zip Slip).
 pub struct PathPolicy {
-    jail: Jail,
+    junk_paths: bool,
 }
 
 impl PathPolicy {
-    /// Create a new path policy for the given destination.
-    pub fn new(destination: &Path) -> Result<Self, Error> {
-        let jail = Jail::new(destination).map_err(|e| Error::PathEscape {
-            entry: destination.display().to_string(),
-            detail: e.to_string(),
-        })?;
-        Ok(Self { jail })
+    pub fn new<P: AsRef<Path>>(_destination: P, junk_paths: bool) -> Result<Self, Error> {
+        Ok(Self { junk_paths })
     }
 
     /// Validate a filename for security issues.
@@ -112,8 +107,8 @@ impl PathPolicy {
 
         // Reject Windows reserved names
         for component in Path::new(name).components() {
-            if let Component::Normal(s) = component {
-                if let Some(s) = s.to_str() {
+            if let Component::Normal(s) = component
+                && let Some(s) = s.to_str() {
                     let s_upper = s.to_ascii_uppercase();
                     let file_stem = s_upper.split('.').next().unwrap_or(&s_upper);
 
@@ -126,7 +121,6 @@ impl PathPolicy {
                         _ => {}
                     }
                 }
-            }
         }
 
         Ok(())
@@ -135,7 +129,6 @@ impl PathPolicy {
 
 impl Policy for PathPolicy {
     fn check(&self, entry: &EntryInfo, _state: &ExtractionState) -> Result<(), Error> {
-        // Validate filename syntax
         if let Err(reason) = Self::validate_filename(&entry.name) {
             return Err(Error::InvalidFilename {
                 entry: entry.name.clone(),
@@ -143,12 +136,30 @@ impl Policy for PathPolicy {
             });
         }
 
-        // Check path jail (prevents traversal)
-        self.jail.join(&entry.name).map_err(|e| Error::PathEscape {
-            entry: entry.name.clone(),
-            detail: e.to_string(),
-        })?;
+        // 2. If junk_paths is enabled, all directories are stripped natively.
+        // We can safely bypass the traversal checks because we only extract the filename.
+        if self.junk_paths {
+            return Ok(());
+        }
 
+        let path = Path::new(&entry.name);
+        for comp in path.components() {
+            match comp {
+                Component::ParentDir => {
+                    return Err(Error::PathEscape {
+                        entry: entry.name.clone(),
+                        detail: "Contains parent directory (..) component".to_string(),
+                    });
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(Error::PathEscape {
+                        entry: entry.name.clone(),
+                        detail: "Contains absolute path component".to_string(),
+                    });
+                }
+                _ => {}
+            }
+        }
         Ok(())
     }
 }
@@ -324,7 +335,7 @@ impl PolicyConfig {
     /// Build a policy chain from this configuration.
     pub fn build(&self) -> Result<PolicyChain, Error> {
         Ok(PolicyChain::new()
-            .with(PathPolicy::new(&self.destination)?)
+            .with(PathPolicy::new(&self.destination, false)?)
             .with(SizePolicy::new(self.max_single_file, self.max_total))
             .with(CountPolicy::new(self.max_files))
             .with(DepthPolicy::new(self.max_depth))

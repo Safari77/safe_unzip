@@ -23,6 +23,7 @@ dist/
 .vscode/
 *.swp
 *~
+/tags
 
 # Generated during build (copied from root)
 python/README.md

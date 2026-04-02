@@ -61,9 +61,6 @@ pub enum Error {
 
     /// IO error (includes TAR format errors since tar crate uses io::Error).
     Io(std::io::Error),
-
-    /// Path jail error.
-    Jail(path_jail::JailError),
 }
 
 /// Format bytes in human-readable form (e.g., "1.5 GB").
@@ -177,7 +174,6 @@ impl fmt::Display for Error {
             }
             Self::Zip(e) => write!(f, "zip format error: {}", e),
             Self::Io(e) => write!(f, "I/O error: {}", e),
-            Self::Jail(e) => write!(f, "path validation error: {}", e),
         }
     }
 }
@@ -187,7 +183,6 @@ impl std::error::Error for Error {
         match self {
             Self::Zip(e) => Some(e),
             Self::Io(e) => Some(e),
-            Self::Jail(e) => Some(e),
             _ => None,
         }
     }
@@ -202,10 +197,5 @@ impl From<zip::result::ZipError> for Error {
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
-    }
-}
-impl From<path_jail::JailError> for Error {
-    fn from(e: path_jail::JailError) -> Self {
-        Self::Jail(e)
     }
 }
