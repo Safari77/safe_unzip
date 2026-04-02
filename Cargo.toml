@@ -59,7 +59,3 @@ opt-level = 1
 lto = false
 debug = true
 strip = false
-
-[patch.crates-io]
-deflate64 = { path = "../deflate64-rs" }
-
