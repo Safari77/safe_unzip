@@ -42,7 +42,7 @@ fn default_state() -> safe_unzip::policy::ExtractionState {
 #[test]
 fn test_path_policy_normal_file() {
     let dest = tempdir().unwrap();
-    let policy = PathPolicy::new(dest.path(), false).unwrap();
+    let policy = PathPolicy::new(dest.path(), false, false, 1024).unwrap();
     let state = default_state();
 
     let entry = file_info("normal.txt", 100);
@@ -52,7 +52,7 @@ fn test_path_policy_normal_file() {
 #[test]
 fn test_path_policy_blocks_traversal() {
     let dest = tempdir().unwrap();
-    let policy = PathPolicy::new(dest.path(), false).unwrap();
+    let policy = PathPolicy::new(dest.path(), false, false, 1024).unwrap();
     let state = default_state();
 
     let entry = file_info("../escape.txt", 100);
@@ -63,7 +63,7 @@ fn test_path_policy_blocks_traversal() {
 #[test]
 fn test_path_policy_blocks_double_dot() {
     let dest = tempdir().unwrap();
-    let policy = PathPolicy::new(dest.path(), false).unwrap();
+    let policy = PathPolicy::new(dest.path(), false, false, 1024).unwrap();
     let state = default_state();
 
     let entry = file_info("foo/../../bar.txt", 100);
@@ -74,7 +74,7 @@ fn test_path_policy_blocks_double_dot() {
 #[test]
 fn test_path_policy_blocks_backslash() {
     let dest = tempdir().unwrap();
-    let policy = PathPolicy::new(dest.path(), false).unwrap();
+    let policy = PathPolicy::new(dest.path(), false, false, 1024).unwrap();
     let state = default_state();
 
     let entry = file_info("folder\\file.txt", 100);
@@ -85,7 +85,7 @@ fn test_path_policy_blocks_backslash() {
 #[test]
 fn test_path_policy_blocks_empty_name() {
     let dest = tempdir().unwrap();
-    let policy = PathPolicy::new(dest.path(), false).unwrap();
+    let policy = PathPolicy::new(dest.path(), false, false, 1024).unwrap();
     let state = default_state();
 
     let entry = file_info("", 100);
@@ -96,7 +96,7 @@ fn test_path_policy_blocks_empty_name() {
 #[test]
 fn test_path_policy_blocks_control_chars() {
     let dest = tempdir().unwrap();
-    let policy = PathPolicy::new(dest.path(), false).unwrap();
+    let policy = PathPolicy::new(dest.path(), false, false, 1024).unwrap();
     let state = default_state();
 
     let entry = file_info("file\x00.txt", 100);
@@ -254,7 +254,7 @@ fn test_policy_chain_empty() {
 #[test]
 fn test_policy_chain_single_policy() {
     let dest = tempdir().unwrap();
-    let chain = PolicyChain::new().with(PathPolicy::new(dest.path(), false).unwrap());
+    let chain = PolicyChain::new().with(PathPolicy::new(dest.path(), false, false, 1024).unwrap());
     let state = default_state();
 
     let entry = file_info("../escape.txt", 100);
@@ -266,7 +266,7 @@ fn test_policy_chain_single_policy() {
 fn test_policy_chain_multiple_policies() {
     let dest = tempdir().unwrap();
     let chain = PolicyChain::new()
-        .with(PathPolicy::new(dest.path(), false).unwrap())
+        .with(PathPolicy::new(dest.path(), false, false, 1024).unwrap())
         .with(SizePolicy::new(100, 1000))
         .with(CountPolicy::new(10));
     let state = default_state();
@@ -300,6 +300,8 @@ fn test_policy_config_build() {
         max_files: 100,
         max_depth: 10,
         symlink_behavior: SymlinkBehavior::Skip,
+        allow_windows_reserved: false,
+        max_path_len: 1024,
     };
 
     let chain = config.build().unwrap();
@@ -325,6 +327,8 @@ fn test_policy_config_symlink_error() {
         max_files: 100,
         max_depth: 10,
         symlink_behavior: SymlinkBehavior::Error,
+        allow_windows_reserved: false,
+        max_path_len: 1024,
     };
 
     let chain = config.build().unwrap();
@@ -343,7 +347,7 @@ fn test_policy_config_symlink_error() {
 fn test_directory_entry_validation() {
     let dest = tempdir().unwrap();
     let chain = PolicyChain::new()
-        .with(PathPolicy::new(dest.path(), false).unwrap())
+        .with(PathPolicy::new(dest.path(), false, false, 1024).unwrap())
         .with(DepthPolicy::new(3));
     let state = default_state();
 
@@ -383,7 +387,7 @@ fn test_path_policy_with_junk_paths() {
     let dest = tempdir().unwrap();
 
     // 1. Test normal mode (should fail on traverse)
-    let strict_policy = PathPolicy::new(dest.path(), false).unwrap();
+    let strict_policy = PathPolicy::new(dest.path(), false, false, 1024).unwrap();
     let state = default_state();
     let bad_entry = file_info("../../etc/passwd", 100);
 
@@ -391,7 +395,7 @@ fn test_path_policy_with_junk_paths() {
     assert!(matches!(result, Err(Error::PathEscape { .. })));
 
     // 2. Test junk_paths mode (should pass traverse because it will be flattened later)
-    let loose_policy = PathPolicy::new(dest.path(), true).unwrap();
+    let loose_policy = PathPolicy::new(dest.path(), true, false, 1024).unwrap();
     let result2 = loose_policy.check(&bad_entry, &state);
     assert!(result2.is_ok());
 }
