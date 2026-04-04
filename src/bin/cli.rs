@@ -866,9 +866,11 @@ fn requires_password(path: &Path, format: &ArchiveFormat) -> bool {
                 }
             false
         }
-        // For other formats, assume password might be needed if prompted,
-        // or we can't easily check without trying to extract.
-        _ => true,
+        // Standard TAR files do not support native encryption
+        ArchiveFormat::Tar | ArchiveFormat::TarGz => false,
+
+        // For SevenZ, you can leave it as true (or ideally implement a check reading the 7z headers)
+        ArchiveFormat::SevenZ => true,
     }
 }
 
