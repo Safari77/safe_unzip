@@ -102,6 +102,7 @@ pub struct Driver {
     junk_paths: bool,
     fsync: bool,
     restore_timestamps: bool,
+    allow_windows_reserved: bool,
 }
 
 impl Driver {
@@ -181,7 +182,13 @@ impl Driver {
             junk_paths: false,
             fsync: false,
             restore_timestamps: false,
+            allow_windows_reserved: false,
         })
+    }
+
+    pub fn allow_windows_reserved(mut self, allow: bool) -> Self {
+        self.allow_windows_reserved = allow;
+        self
     }
 
     pub fn restore_timestamps(mut self, restore: bool) -> Self {
@@ -348,7 +355,7 @@ impl Driver {
     /// Build the policy chain from current settings.
     fn build_policies(&self) -> Result<PolicyChain, Error> {
         Ok(PolicyChain::new()
-            .with(PathPolicy::new(&self.destination, self.junk_paths)?)
+            .with(PathPolicy::new(&self.destination, self.junk_paths, self.allow_windows_reserved)?)
             .with(SizePolicy::new(self.limits.max_single_file, self.limits.max_total_bytes))
             .with(CountPolicy::new(self.limits.max_file_count))
             .with(DepthPolicy::new(self.limits.max_path_depth))

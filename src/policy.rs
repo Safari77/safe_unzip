@@ -70,15 +70,20 @@ impl Default for PolicyChain {
 /// Policy that prevents path traversal attacks (Zip Slip).
 pub struct PathPolicy {
     junk_paths: bool,
+    allow_windows_reserved: bool,
 }
 
 impl PathPolicy {
-    pub fn new<P: AsRef<Path>>(_destination: P, junk_paths: bool) -> Result<Self, Error> {
-        Ok(Self { junk_paths })
+    pub fn new<P: AsRef<Path>>(
+        _destination: P,
+        junk_paths: bool,
+        allow_windows_reserved: bool,
+    ) -> Result<Self, Error> {
+        Ok(Self { junk_paths, allow_windows_reserved })
     }
 
     /// Validate a filename for security issues.
-    fn validate_filename(name: &str) -> Result<(), &'static str> {
+    fn validate_filename(name: &str, allow_windows_reserved: bool) -> Result<(), &'static str> {
         // Reject empty names
         if name.is_empty() {
             return Err("empty filename");
@@ -103,21 +108,23 @@ impl PathPolicy {
             return Err("path component too long (>255 bytes)");
         }
 
-        // Reject Windows reserved names
-        for component in Path::new(name).components() {
-            if let Component::Normal(s) = component
-                && let Some(s) = s.to_str()
-            {
-                let s_upper = s.to_ascii_uppercase();
-                let file_stem = s_upper.split('.').next().unwrap_or(&s_upper);
+        // Possibly reject Windows reserved names
+        if !allow_windows_reserved {
+            for component in Path::new(name).components() {
+                if let Component::Normal(s) = component
+                    && let Some(s) = s.to_str()
+                {
+                    let s_upper = s.to_ascii_uppercase();
+                    let file_stem = s_upper.split('.').next().unwrap_or(&s_upper);
 
-                match file_stem {
-                    "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5"
-                    | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3" | "LPT4"
-                    | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => {
-                        return Err("Windows reserved name");
+                    match file_stem {
+                        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4"
+                        | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3"
+                        | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => {
+                            return Err("Windows reserved name");
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }
@@ -128,7 +135,7 @@ impl PathPolicy {
 
 impl Policy for PathPolicy {
     fn check(&self, entry: &EntryInfo, _state: &ExtractionState) -> Result<(), Error> {
-        if let Err(reason) = Self::validate_filename(&entry.name) {
+        if let Err(reason) = Self::validate_filename(&entry.name, self.allow_windows_reserved) {
             return Err(Error::InvalidFilename {
                 entry: entry.name.clone(),
                 reason: reason.to_string(),
@@ -325,13 +332,14 @@ pub struct PolicyConfig {
     pub max_files: usize,
     pub max_depth: usize,
     pub symlink_behavior: SymlinkBehavior,
+    pub allow_windows_reserved: bool,
 }
 
 impl PolicyConfig {
     /// Build a policy chain from this configuration.
     pub fn build(&self) -> Result<PolicyChain, Error> {
         Ok(PolicyChain::new()
-            .with(PathPolicy::new(&self.destination, false)?)
+            .with(PathPolicy::new(&self.destination, false, self.allow_windows_reserved)?)
             .with(SizePolicy::new(self.max_single_file, self.max_total))
             .with(CountPolicy::new(self.max_files))
             .with(DepthPolicy::new(self.max_depth))

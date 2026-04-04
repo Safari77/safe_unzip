@@ -146,6 +146,7 @@ pub struct Extractor {
     password: Option<Vec<u8>>,
     fsync: bool,
     restore_timestamps: bool,
+    allow_windows_reserved: bool,
 }
 
 impl Extractor {
@@ -219,7 +220,13 @@ impl Extractor {
             password: None,
             fsync: false,
             restore_timestamps: false,
+            allow_windows_reserved: false,
         })
+    }
+
+    pub fn allow_windows_reserved(mut self, allow: bool) -> Self {
+        self.allow_windows_reserved = allow;
+        self
     }
 
     pub fn fsync(mut self, fsync: bool) -> Self {
@@ -921,26 +928,29 @@ impl Extractor {
             return Err("path component too long (>255 bytes)");
         }
 
-        // Check path components for reserved names
-        let path = Path::new(name);
-        for component in path.components() {
-            if let Component::Normal(os_str) = component
-                && let Some(s) = os_str.to_str()
-            {
-                // Windows reserved names
-                let s_upper = s.to_ascii_uppercase();
-                let file_stem = s_upper.split('.').next().unwrap_or(&s_upper);
+        // Possibly check path components for reserved names
+        if !self.allow_windows_reserved {
+            let path = Path::new(name);
+            for component in path.components() {
+                if let Component::Normal(os_str) = component
+                    && let Some(s) = os_str.to_str()
+                {
+                    // Windows reserved names
+                    let s_upper = s.to_ascii_uppercase();
+                    let file_stem = s_upper.split('.').next().unwrap_or(&s_upper);
 
-                match file_stem {
-                    "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5"
-                    | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3" | "LPT4"
-                    | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => {
-                        return Err("Windows reserved name");
+                    match file_stem {
+                        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4"
+                        | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3"
+                        | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => {
+                            return Err("Windows reserved name");
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }
+
         Ok(())
     }
 }

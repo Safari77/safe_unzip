@@ -99,6 +99,10 @@ struct Cli {
     #[arg(long)]
     restore_timestamps: bool,
 
+    /// Allow extracting Windows reserved filenames (e.g., CON, LPT1) on non-Windows OSs
+    #[arg(long)]
+    allow_windows_reserved: bool,
+
     /// Override file permissions (octal, e.g., 644)
     #[arg(long, value_parser = parse_mode)]
     file_mode: Option<u32>,
@@ -339,6 +343,7 @@ fn extract_zip(cli: &Cli, archive: &Path) -> Result<(), Error> {
         .junk_paths(cli.junk_paths)
         .fsync(cli.fsync)
         .restore_timestamps(cli.restore_timestamps)
+        .allow_windows_reserved(cli.allow_windows_reserved)
         .password(cli.password.as_deref());
 
     if let Some(m) = cli.file_mode {
