@@ -7,9 +7,6 @@ use std::fs;
 use std::io::{Read, Seek, Write};
 use std::path::{Component, Path};
 
-#[cfg(unix)]
-use cap_std::fs::PermissionsExt;
-
 /// What to do when a file already exists at the extraction path.
 ///
 /// # Security Note
@@ -111,6 +108,7 @@ pub struct EntryInfo<'a> {
     pub compressed_size: u64,
     pub is_dir: bool,
     pub is_symlink: bool,
+    pub mtime: Option<u64>,
 }
 
 /// Progress information passed to callbacks.
@@ -147,6 +145,7 @@ pub struct Extractor {
     junk_paths: bool,
     password: Option<Vec<u8>>,
     fsync: bool,
+    restore_timestamps: bool,
 }
 
 impl Extractor {
@@ -200,13 +199,11 @@ impl Extractor {
             }
         }
 
-        let utf8_dest =
-            Utf8Path::from_path(destination).ok_or_else(|| Error::DestinationNotFound {
-                path: destination.to_string_lossy().to_string(),
-            })?;
+        let utf8_dest = Utf8Path::from_path(destination).ok_or_else(|| {
+            Error::DestinationNotFound { path: destination.to_string_lossy().to_string() }
+        })?;
         // Securely open the destination directory holding a file descriptor
-        let dir =
-            Dir::open_ambient_dir(utf8_dest, ambient_authority()).map_err(Error::Io)?;
+        let dir = Dir::open_ambient_dir(utf8_dest, ambient_authority()).map_err(Error::Io)?;
 
         Ok(Self {
             dir,
@@ -221,11 +218,17 @@ impl Extractor {
             junk_paths: false,
             password: None,
             fsync: false,
+            restore_timestamps: false,
         })
     }
 
     pub fn fsync(mut self, fsync: bool) -> Self {
         self.fsync = fsync;
+        self
+    }
+
+    pub fn restore_timestamps(mut self, restore: bool) -> Self {
+        self.restore_timestamps = restore;
         self
     }
 
@@ -323,11 +326,7 @@ impl Extractor {
     /// ```
     pub fn include_glob<S: AsRef<str>>(self, patterns: &[S]) -> Self {
         let patterns: Vec<String> = patterns.iter().map(|s| s.as_ref().to_string()).collect();
-        self.filter(move |entry| {
-            patterns
-                .iter()
-                .any(|p| glob_match::glob_match(p, entry.name))
-        })
+        self.filter(move |entry| patterns.iter().any(|p| glob_match::glob_match(p, entry.name)))
     }
 
     /// Exclude files matching a glob pattern.
@@ -348,11 +347,7 @@ impl Extractor {
     /// ```
     pub fn exclude_glob<S: AsRef<str>>(self, patterns: &[S]) -> Self {
         let patterns: Vec<String> = patterns.iter().map(|s| s.as_ref().to_string()).collect();
-        self.filter(move |entry| {
-            !patterns
-                .iter()
-                .any(|p| glob_match::glob_match(p, entry.name))
-        })
+        self.filter(move |entry| !patterns.iter().any(|p| glob_match::glob_match(p, entry.name)))
     }
 
     /// Set a progress callback.
@@ -418,10 +413,7 @@ impl Extractor {
 
             // 0. SECURITY: Filename Sanitization
             if let Err(reason) = self.validate_filename(&name) {
-                return Err(Error::InvalidFilename {
-                    entry: name,
-                    reason: reason.to_string(),
-                });
+                return Err(Error::InvalidFilename { entry: name, reason: reason.to_string() });
             }
 
             // 1. Modified Path Resolution
@@ -462,10 +454,8 @@ impl Extractor {
 
             // 3. CHECK: Limits (Depth)
             // Count normal components to check depth
-            let depth = Path::new(&name)
-                .components()
-                .filter(|c| matches!(c, Component::Normal(_)))
-                .count();
+            let depth =
+                Path::new(&name).components().filter(|c| matches!(c, Component::Normal(_))).count();
             if depth > self.limits.max_path_depth {
                 return Err(Error::PathTooDeep {
                     entry: name,
@@ -474,6 +464,7 @@ impl Extractor {
                 });
             }
 
+            let mtime = crate::adapter::zip_adapter::zip_time_to_timestamp(entry.last_modified());
             // 4. CHECK: Filter (User Logic)
             let info = EntryInfo {
                 name: &name,
@@ -481,13 +472,15 @@ impl Extractor {
                 compressed_size: entry.compressed_size(),
                 is_dir: entry.is_dir(),
                 is_symlink: entry.is_symlink(),
+                mtime,
             };
 
             if let Some(ref filter) = self.filter
-                && !filter(&info) {
-                    report.entries_skipped += 1;
-                    continue;
-                }
+                && !filter(&info)
+            {
+                report.entries_skipped += 1;
+                continue;
+            }
 
             // 5. CHECK: Limits (Count & Lookahead Total)
             // Check file count
@@ -518,25 +511,18 @@ impl Extractor {
 
             // 7. EXECUTION
             if entry.is_dir() {
-                if let Err(e) = self.dir.create_dir_all(&safe_relative_path) {
-                    // map errors if cap-std blocks traversal
-                    return Err(Error::Io(e));
-                }
-                report.dirs_created += 1;
-                #[cfg(unix)]
-                if let Some(mode) = self.dir_mode.or_else(|| entry.unix_mode()) {
-                    let safe_mode = mode & 0o0777;
-                    self.dir.set_permissions(
-                        &safe_relative_path,
-                        cap_std::fs::Permissions::from_mode(safe_mode),
-                    )?;
-                }
+                crate::entry::ensure_directory(
+                    &self.dir,
+                    &safe_relative_path,
+                    self.dir_mode.or_else(|| entry.unix_mode()),
+                )?;
             } else {
                 if !self.junk_paths
                     && let Some(parent) = camino::Utf8Path::new(&safe_relative_path).parent()
-                        && !parent.as_str().is_empty() {
-                            self.dir.create_dir_all(parent)?;
-                        }
+                    && !parent.as_str().is_empty()
+                {
+                    crate::entry::ensure_directory(&self.dir, parent.as_str(), self.dir_mode)?;
+                }
 
                 // SECURITY: Atomic file creation based on overwrite policy utilizing openat2 under the hood
                 let mut actual_path = safe_relative_path.clone();
@@ -568,9 +554,10 @@ impl Extractor {
                     }
                     OverwritePolicy::Overwrite => {
                         if let Ok(m) = self.dir.symlink_metadata(&actual_path)
-                            && m.file_type().is_symlink() {
-                                let _ = self.dir.remove_file(&actual_path);
-                            }
+                            && m.file_type().is_symlink()
+                        {
+                            let _ = self.dir.remove_file(&actual_path);
+                        }
                         self.dir.create(&actual_path)?
                     }
                     OverwritePolicy::RenameBase | OverwritePolicy::RenameExt => {
@@ -628,10 +615,8 @@ impl Extractor {
                 // 3. limits.max_total_bytes - catch global limit violation
 
                 let limit_single = self.limits.max_single_file.min(entry.size());
-                let remaining_global = self
-                    .limits
-                    .max_total_bytes
-                    .saturating_sub(total_bytes_written);
+                let remaining_global =
+                    self.limits.max_total_bytes.saturating_sub(total_bytes_written);
                 let hard_limit = limit_single.min(remaining_global);
 
                 let mut limiter = LimitReader::new(&mut entry, hard_limit);
@@ -685,10 +670,6 @@ impl Extractor {
                     // Which implies one of the above errors triggered.
                 }
 
-                if self.fsync {
-                    outfile.sync_all()?;
-                }
-
                 // SECURITY: Detect zip bombs that lie about declared size.
                 // If we wrote exactly the declared size, check if there's more data.
                 // If so, the file is larger than declared (potential zip bomb).
@@ -707,19 +688,29 @@ impl Extractor {
                 report.bytes_written += written;
                 report.files_extracted += 1;
 
+                let std_outfile = outfile.into_std();
+
+                // 2. PERMISSIONS: Apply via the open File Descriptor (faster and safer)
                 #[cfg(unix)]
-                if let Some(mode) = self.file_mode.or_else(|| entry.unix_mode()) {
-                    let safe_mode = mode & 0o0777;
-                    self.dir.set_permissions(
-                        &actual_path,
-                        cap_std::fs::Permissions::from_mode(safe_mode),
-                    )?;
+                {
+                    if let Some(mode) = self.file_mode.or_else(|| entry.unix_mode()) {
+                        use std::os::unix::fs::PermissionsExt;
+                        let safe_mode = mode & 0o0777;
+
+                        std_outfile.set_permissions(std::fs::Permissions::from_mode(safe_mode))?;
+                    }
+                }
+
+                if self.fsync {
+                    std_outfile.sync_all()?;
+                }
+
+                if self.restore_timestamps {
+                    crate::entry::restore_file_times(std_outfile, info.mtime, info.name);
                 }
 
                 if actual_path != safe_relative_path {
-                    report
-                        .renames
-                        .push((safe_relative_path.clone(), actual_path.clone()));
+                    report.renames.push((safe_relative_path.clone(), actual_path.clone()));
                 }
             }
         }
@@ -748,19 +739,14 @@ impl Extractor {
 
             // 0. Filename sanitization
             if let Err(reason) = self.validate_filename(&name) {
-                return Err(Error::InvalidFilename {
-                    entry: name,
-                    reason: reason.to_string(),
-                });
+                return Err(Error::InvalidFilename { entry: name, reason: reason.to_string() });
             }
 
             // 1. Path validation (Zip Slip early check)
             let path = Path::new(&name);
             for comp in path.components() {
-                if matches!(
-                    comp,
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                ) {
+                if matches!(comp, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+                {
                     return Err(Error::PathEscape {
                         entry: name.clone(),
                         detail: "Invalid path component detected".to_string(),
@@ -777,10 +763,8 @@ impl Extractor {
             }
 
             // 3. Path depth check
-            let depth = Path::new(&name)
-                .components()
-                .filter(|c| matches!(c, Component::Normal(_)))
-                .count();
+            let depth =
+                Path::new(&name).components().filter(|c| matches!(c, Component::Normal(_))).count();
             if depth > self.limits.max_path_depth {
                 return Err(Error::PathTooDeep {
                     entry: name,
@@ -896,10 +880,7 @@ impl Extractor {
             bytes_verified += entry_bytes;
         }
 
-        Ok(VerifyReport {
-            entries_verified,
-            bytes_verified,
-        })
+        Ok(VerifyReport { entries_verified, bytes_verified })
     }
 
     /// Verify archive integrity from a file path.
@@ -944,20 +925,21 @@ impl Extractor {
         let path = Path::new(name);
         for component in path.components() {
             if let Component::Normal(os_str) = component
-                && let Some(s) = os_str.to_str() {
-                    // Windows reserved names
-                    let s_upper = s.to_ascii_uppercase();
-                    let file_stem = s_upper.split('.').next().unwrap_or(&s_upper);
+                && let Some(s) = os_str.to_str()
+            {
+                // Windows reserved names
+                let s_upper = s.to_ascii_uppercase();
+                let file_stem = s_upper.split('.').next().unwrap_or(&s_upper);
 
-                    match file_stem {
-                        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4"
-                        | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3"
-                        | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => {
-                            return Err("Windows reserved name");
-                        }
-                        _ => {}
+                match file_stem {
+                    "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5"
+                    | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3" | "LPT4"
+                    | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => {
+                        return Err("Windows reserved name");
                     }
+                    _ => {}
                 }
+            }
         }
         Ok(())
     }
@@ -973,12 +955,7 @@ struct LimitReader<'a, R> {
 
 impl<'a, R: Read> LimitReader<'a, R> {
     fn new(inner: &'a mut R, limit: u64) -> Self {
-        Self {
-            inner,
-            limit,
-            bytes_read: 0,
-            hit_limit: false,
-        }
+        Self { inner, limit, bytes_read: 0, hit_limit: false }
     }
 }
 

@@ -1,11 +1,11 @@
 //! Unit tests for individual policy implementations
 
+use safe_unzip::Error;
 use safe_unzip::entry::EntryKind;
 use safe_unzip::policy::{
     CountPolicy, DepthPolicy, PathPolicy, Policy, PolicyChain, PolicyConfig, SizePolicy,
     SymlinkBehavior, SymlinkPolicy,
 };
-use safe_unzip::Error;
 use tempfile::tempdir;
 
 /// Helper to create an EntryInfo (the runtime entry type policies use)
@@ -15,6 +15,7 @@ fn make_entry_info(name: &str, size: u64, kind: EntryKind) -> safe_unzip::entry:
         size,
         kind,
         mode: Some(0o644),
+        mtime: None,
     }
 }
 
@@ -27,13 +28,7 @@ fn dir_info(name: &str) -> safe_unzip::entry::EntryInfo {
 }
 
 fn symlink_info(name: &str, target: &str) -> safe_unzip::entry::EntryInfo {
-    make_entry_info(
-        name,
-        0,
-        EntryKind::Symlink {
-            target: target.to_string(),
-        },
-    )
+    make_entry_info(name, 0, EntryKind::Symlink { target: target.to_string() })
 }
 
 fn default_state() -> safe_unzip::policy::ExtractionState {

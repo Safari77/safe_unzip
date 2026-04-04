@@ -39,9 +39,7 @@ pub struct PolicyChain {
 impl PolicyChain {
     /// Create a new empty policy chain.
     pub fn new() -> Self {
-        Self {
-            policies: Vec::new(),
-        }
+        Self { policies: Vec::new() }
     }
 
     /// Add a policy to the chain.
@@ -108,19 +106,20 @@ impl PathPolicy {
         // Reject Windows reserved names
         for component in Path::new(name).components() {
             if let Component::Normal(s) = component
-                && let Some(s) = s.to_str() {
-                    let s_upper = s.to_ascii_uppercase();
-                    let file_stem = s_upper.split('.').next().unwrap_or(&s_upper);
+                && let Some(s) = s.to_str()
+            {
+                let s_upper = s.to_ascii_uppercase();
+                let file_stem = s_upper.split('.').next().unwrap_or(&s_upper);
 
-                    match file_stem {
-                        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4"
-                        | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3"
-                        | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => {
-                            return Err("Windows reserved name");
-                        }
-                        _ => {}
+                match file_stem {
+                    "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5"
+                    | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3" | "LPT4"
+                    | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => {
+                        return Err("Windows reserved name");
                     }
+                    _ => {}
                 }
+            }
         }
 
         Ok(())
@@ -179,10 +178,7 @@ pub struct SizePolicy {
 impl SizePolicy {
     /// Create a new size policy with the given limits.
     pub fn new(max_single_file: u64, max_total: u64) -> Self {
-        Self {
-            max_single_file,
-            max_total,
-        }
+        Self { max_single_file, max_total }
     }
 }
 

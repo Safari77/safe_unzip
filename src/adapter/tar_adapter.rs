@@ -36,10 +36,7 @@ impl<R: Read> TarAdapter<R> {
     /// For `.tar.gz` files, wrap the reader in `GzDecoder` first,
     /// or use `TarAdapter::open_gz()`.
     pub fn new(reader: R) -> Self {
-        Self {
-            archive: tar::Archive::new(reader),
-            cached_entries: None,
-        }
+        Self { archive: tar::Archive::new(reader), cached_entries: None }
     }
 
     /// Process each entry with a callback.
@@ -85,6 +82,7 @@ impl<R: Read> TarAdapter<R> {
                 size: header.size()?,
                 kind: kind.clone(),
                 mode: header.mode().ok(),
+                mtime: header.mtime().ok(),
             };
 
             let continue_extraction = if matches!(kind, EntryKind::File) {
@@ -142,6 +140,7 @@ impl<R: Read> TarAdapter<R> {
                 size: header.size()?,
                 kind: kind.clone(),
                 mode: header.mode().ok(),
+                mtime: header.mtime().ok(),
             };
 
             // Read file content into memory
@@ -164,9 +163,7 @@ impl<R: Read> TarAdapter<R> {
         F: FnMut(EntryInfo, Option<&[u8]>) -> Result<bool, Error>,
     {
         let cached = self.cached_entries.take().ok_or_else(|| {
-            Error::Io(std::io::Error::other(
-                "no cached entries (call cache_all first)",
-            ))
+            Error::Io(std::io::Error::other("no cached entries (call cache_all first)"))
         })?;
 
         for entry in cached {

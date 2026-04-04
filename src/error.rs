@@ -21,25 +21,13 @@ pub enum Error {
     FileCountExceeded { limit: usize, attempted: usize },
 
     /// Single file exceeds size limit.
-    FileTooLarge {
-        entry: String,
-        limit: u64,
-        size: u64,
-    },
+    FileTooLarge { entry: String, limit: u64, size: u64 },
 
     /// Actual decompressed size exceeds declared size (potential zip bomb).
-    SizeMismatch {
-        entry: String,
-        declared: u64,
-        actual: u64,
-    },
+    SizeMismatch { entry: String, declared: u64, actual: u64 },
 
     /// Path exceeds depth limit.
-    PathTooDeep {
-        entry: String,
-        depth: usize,
-        limit: usize,
-    },
+    PathTooDeep { entry: String, depth: usize, limit: usize },
 
     /// File already exists and policy is Error.
     AlreadyExists { entry: String },
@@ -88,11 +76,7 @@ impl fmt::Display for Error {
             }
             Self::SymlinkNotAllowed { entry, target } => {
                 if target.is_empty() {
-                    write!(
-                        f,
-                        "archive contains symlink '{}' (symlinks not allowed)",
-                        entry
-                    )
+                    write!(f, "archive contains symlink '{}' (symlinks not allowed)", entry)
                 } else {
                     write!(
                         f,
@@ -125,11 +109,7 @@ impl fmt::Display for Error {
                     format_bytes(*limit)
                 )
             }
-            Self::SizeMismatch {
-                entry,
-                declared,
-                actual,
-            } => {
+            Self::SizeMismatch { entry, declared, actual } => {
                 write!(
                     f,
                     "file '{}' decompressed to {} but declared {} (possible zip bomb)",
@@ -138,16 +118,8 @@ impl fmt::Display for Error {
                     format_bytes(*declared)
                 )
             }
-            Self::PathTooDeep {
-                entry,
-                depth,
-                limit,
-            } => {
-                write!(
-                    f,
-                    "path '{}' has {} directory levels (limit: {})",
-                    entry, depth, limit
-                )
+            Self::PathTooDeep { entry, depth, limit } => {
+                write!(f, "path '{}' has {} directory levels (limit: {})", entry, depth, limit)
             }
             Self::AlreadyExists { entry } => {
                 write!(f, "file '{}' already exists", entry)
@@ -159,11 +131,7 @@ impl fmt::Display for Error {
                 write!(f, "invalid filename '{}': {}", entry, reason)
             }
             Self::EncryptedEntry { entry } => {
-                write!(
-                    f,
-                    "entry '{}' is encrypted (encrypted archives not supported)",
-                    entry
-                )
+                write!(f, "entry '{}' is encrypted (encrypted archives not supported)", entry)
             }
             Self::UnsupportedEntryType { entry, entry_type } => {
                 write!(

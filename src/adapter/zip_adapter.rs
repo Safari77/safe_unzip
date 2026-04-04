@@ -19,10 +19,7 @@ impl<R: Read + Seek> ZipAdapter<R> {
     /// Create a new ZipAdapter from a reader.
     pub fn new(reader: R) -> Result<Self, Error> {
         let archive = zip::ZipArchive::new(reader)?;
-        Ok(Self {
-            archive,
-            password: None,
-        })
+        Ok(Self { archive, password: None })
     }
 
     pub fn password<P: AsRef<[u8]>>(&mut self, password: Option<P>) {
@@ -73,6 +70,7 @@ impl<R: Read + Seek> ZipAdapter<R> {
                 size: entry.size(),
                 kind,
                 mode: entry.unix_mode(),
+                mtime: zip_time_to_timestamp(entry.last_modified()),
             });
         }
 
@@ -125,6 +123,7 @@ impl<R: Read + Seek> ZipAdapter<R> {
                 size: entry.size(),
                 kind: kind.clone(),
                 mode: entry.unix_mode(),
+                mtime: zip_time_to_timestamp(entry.last_modified()),
             };
 
             // For files, provide the reader; for dirs/symlinks, no reader needed
@@ -182,6 +181,7 @@ impl<R: Read + Seek> ZipAdapter<R> {
             size: entry.size(),
             kind: kind.clone(),
             mode: entry.unix_mode(),
+            mtime: zip_time_to_timestamp(entry.last_modified()),
         };
 
         let bytes_written = if matches!(kind, EntryKind::File) {
@@ -210,9 +210,7 @@ impl<R: Read + Seek> ZipAdapter<R> {
         let kind = if entry.is_dir() {
             EntryKind::Directory
         } else if entry.is_symlink() {
-            EntryKind::Symlink {
-                target: String::new(),
-            }
+            EntryKind::Symlink { target: String::new() }
         } else {
             EntryKind::File
         };
@@ -222,6 +220,7 @@ impl<R: Read + Seek> ZipAdapter<R> {
             size: entry.size(),
             kind,
             mode: entry.unix_mode(),
+            mtime: zip_time_to_timestamp(entry.last_modified()),
         })
     }
 }
@@ -261,4 +260,28 @@ fn copy_limited<R: Read, W: Write>(
     }
 
     Ok(total)
+}
+
+/// Helper to safely convert zip::DateTime to a Unix timestamp.
+/// MS-DOS times are often invalid (e.g. day 0, second 60). We clamp
+/// and sanitize them to ensure `chrono` doesn't reject the date.
+pub(crate) fn zip_time_to_timestamp(dt: Option<zip::DateTime>) -> Option<u64> {
+    let dt = dt?;
+
+    let year = dt.year() as i32;
+    let month = (dt.month() as u32).clamp(1, 12);
+    let day = (dt.day() as u32).clamp(1, 31);
+    let hour = (dt.hour() as u32).min(23);
+    let minute = (dt.minute() as u32).min(59);
+    let second = (dt.second() as u32).min(59); // ZIP allows 60 for leap seconds, chrono rejects it
+
+    // Attempt to parse the exact date. If it's an invalid combination (like Feb 30th),
+    // fallback to the 1st of the month.
+    let date = chrono::NaiveDate::from_ymd_opt(year, month, day)
+        .or_else(|| chrono::NaiveDate::from_ymd_opt(year, month, 1))
+        .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(1980, 1, 1).unwrap());
+
+    let time = chrono::NaiveTime::from_hms_opt(hour, minute, second).unwrap_or_default();
+
+    Some(chrono::NaiveDateTime::new(date, time).and_utc().timestamp() as u64)
 }

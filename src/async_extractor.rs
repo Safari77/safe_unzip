@@ -64,9 +64,7 @@ impl AsyncExtractor {
     pub fn new<P: AsRef<Path>>(destination: P) -> Result<Self, Error> {
         let dest = destination.as_ref();
         if !dest.exists() {
-            return Err(Error::DestinationNotFound {
-                path: dest.display().to_string(),
-            });
+            return Err(Error::DestinationNotFound { path: dest.display().to_string() });
         }
         Ok(Self {
             destination: dest.to_path_buf(),
@@ -240,7 +238,7 @@ impl AsyncExtractor {
             .limits(self.limits)
             .overwrite(self.overwrite)
             .symlinks(self.symlinks)
-            .mode(self.mode))
+            .mode(self.mode)
             .fsync(self.fsync))
     }
 
@@ -256,7 +254,7 @@ impl AsyncExtractor {
             .limits(self.limits)
             .overwrite(convert_overwrite_policy(self.overwrite))
             .symlinks(convert_symlink_policy(self.symlinks))
-            .validation(convert_extraction_mode(self.mode)))
+            .validation(convert_extraction_mode(self.mode))
             .fsync(self.fsync))
     }
 }
@@ -323,9 +321,7 @@ where
     D: AsRef<Path>,
     F: AsRef<Path>,
 {
-    AsyncExtractor::new_or_create(destination)?
-        .extract_file(file_path)
-        .await
+    AsyncExtractor::new_or_create(destination)?.extract_file(file_path).await
 }
 
 /// Extract a ZIP from bytes asynchronously with default settings.
@@ -335,9 +331,7 @@ pub async fn extract_bytes<D>(destination: D, data: Vec<u8>) -> Result<Report, E
 where
     D: AsRef<Path>,
 {
-    AsyncExtractor::new_or_create(destination)?
-        .extract_bytes(data)
-        .await
+    AsyncExtractor::new_or_create(destination)?.extract_bytes(data).await
 }
 
 /// Extract a TAR file asynchronously with default settings.
@@ -362,9 +356,7 @@ where
     D: AsRef<Path>,
     F: AsRef<Path>,
 {
-    AsyncExtractor::new_or_create(destination)?
-        .extract_tar_file(file_path)
-        .await
+    AsyncExtractor::new_or_create(destination)?.extract_tar_file(file_path).await
 }
 
 /// Extract a gzip-compressed TAR file asynchronously with default settings.
@@ -389,9 +381,7 @@ where
     D: AsRef<Path>,
     F: AsRef<Path>,
 {
-    AsyncExtractor::new_or_create(destination)?
-        .extract_tar_gz_file(file_path)
-        .await
+    AsyncExtractor::new_or_create(destination)?.extract_tar_gz_file(file_path).await
 }
 
 /// Extract a TAR from bytes asynchronously with default settings.
@@ -402,9 +392,7 @@ pub async fn extract_tar_bytes<D>(destination: D, data: Vec<u8>) -> Result<Repor
 where
     D: AsRef<Path>,
 {
-    AsyncExtractor::new_or_create(destination)?
-        .extract_tar_bytes(data)
-        .await
+    AsyncExtractor::new_or_create(destination)?.extract_tar_bytes(data).await
 }
 
 /// Extract a gzip-compressed TAR from bytes asynchronously with default settings.
@@ -415,7 +403,5 @@ pub async fn extract_tar_gz_bytes<D>(destination: D, data: Vec<u8>) -> Result<Re
 where
     D: AsRef<Path>,
 {
-    AsyncExtractor::new_or_create(destination)?
-        .extract_tar_gz_bytes(data)
-        .await
+    AsyncExtractor::new_or_create(destination)?.extract_tar_gz_bytes(data).await
 }

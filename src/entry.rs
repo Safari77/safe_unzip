@@ -30,6 +30,8 @@ pub struct Entry<'a> {
     pub kind: EntryKind,
     /// Unix permissions (if available).
     pub mode: Option<u32>,
+    /// Modification time
+    pub mtime: Option<u64>,
     /// A reader to access the entry's content.
     pub reader: Box<dyn Read + 'a>,
 }
@@ -77,6 +79,8 @@ pub struct EntryInfo {
     pub kind: EntryKind,
     /// Unix permissions (if available).
     pub mode: Option<u32>,
+    /// Restored file modification time
+    pub mtime: Option<u64>,
 }
 
 impl<'a> From<&Entry<'a>> for EntryInfo {
@@ -86,6 +90,55 @@ impl<'a> From<&Entry<'a>> for EntryInfo {
             size: entry.size,
             kind: entry.kind.clone(),
             mode: entry.mode,
+            mtime: entry.mtime,
         }
     }
+}
+
+/// Securely applies the modified time to an open file descriptor,
+/// preventing symlink TOC-TOU attacks.
+pub(crate) fn restore_file_times(file: std::fs::File, mtime: Option<u64>, name: &str) {
+    if let Some(m) = mtime {
+        let st = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(m);
+        if let Err(e) = file.set_modified(st) {
+            eprintln!("Warning: Could not set timestamp for {}: {}", name, e);
+        }
+    } else {
+        eprintln!("Warning: No valid timestamp found in archive for {}", name);
+    }
+    // `file` drops here, securely closing the file descriptor.
+}
+
+/// Securely creates a directory path using cap_std and applies dir_mode to each newly created component.
+pub(crate) fn ensure_directory(
+    dir: &cap_std::fs_utf8::Dir,
+    path: &str,
+    dir_mode: Option<u32>,
+) -> Result<(), crate::error::Error> {
+    let utf8_path = camino::Utf8Path::new(path);
+    let mut current = camino::Utf8PathBuf::new();
+
+    for component in utf8_path.components() {
+        current.push(component);
+        if current.as_str().is_empty() || current.as_str() == "/" {
+            continue;
+        }
+
+        match dir.create_dir(&current) {
+            Ok(()) => {
+                #[cfg(unix)]
+                if let Some(mode) = dir_mode {
+                    // Scope cap_std's PermissionsExt trait locally
+                    use cap_std::fs::PermissionsExt;
+                    let safe_mode = mode & 0o0777;
+                    // Ignore errors here, as cap-std will block unsafe traversal anyway
+                    let _ = dir
+                        .set_permissions(&current, cap_std::fs::Permissions::from_mode(safe_mode));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
 }

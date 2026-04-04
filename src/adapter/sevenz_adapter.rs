@@ -63,11 +63,8 @@ impl SevenZAdapter {
                 let name = entry.name().to_string();
 
                 // Determine entry kind
-                let kind = if entry.is_directory() {
-                    EntryKind::Directory
-                } else {
-                    EntryKind::File
-                };
+                let kind =
+                    if entry.is_directory() { EntryKind::Directory } else { EntryKind::File };
 
                 // Read content for files
                 let mut data = Vec::new();
@@ -80,6 +77,7 @@ impl SevenZAdapter {
                     size: data.len() as u64,
                     kind,
                     mode: None, // 7z doesn't preserve Unix permissions
+                    mtime: None,
                 };
 
                 entries.push(SevenZEntry { info, data });

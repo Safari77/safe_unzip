@@ -254,6 +254,7 @@ pub fn list_tar<R: std::io::Read>(reader: R) -> Result<Vec<entry::EntryInfo>, Er
             size: header.size()?,
             kind,
             mode: header.mode().ok(),
+            mtime: None,
         });
     }
 
