@@ -523,6 +523,7 @@ impl Extractor {
                     &safe_relative_path,
                     self.dir_mode.or_else(|| entry.unix_mode()),
                 )?;
+                report.dirs_created += 1;
             } else {
                 if !self.junk_paths
                     && let Some(parent) = camino::Utf8Path::new(&safe_relative_path).parent()
