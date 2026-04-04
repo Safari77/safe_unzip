@@ -71,6 +71,7 @@ impl Default for PolicyChain {
 pub struct PathPolicy {
     junk_paths: bool,
     allow_windows_reserved: bool,
+    max_path_len: usize,
 }
 
 impl PathPolicy {
@@ -78,37 +79,39 @@ impl PathPolicy {
         _destination: P,
         junk_paths: bool,
         allow_windows_reserved: bool,
+        max_path_len: usize,
     ) -> Result<Self, Error> {
-        Ok(Self { junk_paths, allow_windows_reserved })
+        Ok(Self { junk_paths, allow_windows_reserved, max_path_len })
     }
 
     /// Validate a filename for security issues.
-    fn validate_filename(name: &str, allow_windows_reserved: bool) -> Result<(), &'static str> {
-        // Reject empty names
+    fn validate_filename(
+        name: &str,
+        allow_windows_reserved: bool,
+        max_path_len: usize,
+    ) -> Result<(), String> {
+        // 2. Add .to_string() to all static strings
         if name.is_empty() {
-            return Err("empty filename");
+            return Err("empty filename".to_string());
         }
 
-        // Reject control characters (includes null bytes)
         if name.chars().any(|c| c.is_control()) {
-            return Err("contains control characters");
+            return Err("contains control characters".to_string());
         }
 
-        // Reject backslashes (Windows path separator could bypass Unix checks)
         if name.contains('\\') {
-            return Err("contains backslash");
+            return Err("contains backslash".to_string());
         }
 
-        // Reject extremely long filenames
-        if name.len() > 1024 {
-            return Err("path too long (>1024 bytes)");
+        // 3. Properly use the format! macro
+        if name.len() > max_path_len {
+            return Err(format!("path too long ({}>{} bytes)", name.len(), max_path_len));
         }
 
         if name.split('/').any(|component| component.len() > 255) {
-            return Err("path component too long (>255 bytes)");
+            return Err("path component too long (>255 bytes)".to_string());
         }
 
-        // Possibly reject Windows reserved names
         if !allow_windows_reserved {
             for component in Path::new(name).components() {
                 if let Component::Normal(s) = component
@@ -121,7 +124,7 @@ impl PathPolicy {
                         "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4"
                         | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3"
                         | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => {
-                            return Err("Windows reserved name");
+                            return Err("Windows reserved name".to_string());
                         }
                         _ => {}
                     }
@@ -135,11 +138,10 @@ impl PathPolicy {
 
 impl Policy for PathPolicy {
     fn check(&self, entry: &EntryInfo, _state: &ExtractionState) -> Result<(), Error> {
-        if let Err(reason) = Self::validate_filename(&entry.name, self.allow_windows_reserved) {
-            return Err(Error::InvalidFilename {
-                entry: entry.name.clone(),
-                reason: reason.to_string(),
-            });
+        if let Err(reason) =
+            Self::validate_filename(&entry.name, self.allow_windows_reserved, self.max_path_len)
+        {
+            return Err(Error::InvalidFilename { entry: entry.name.clone(), reason });
         }
 
         // 2. If junk_paths is enabled, all directories are stripped natively.
@@ -333,13 +335,19 @@ pub struct PolicyConfig {
     pub max_depth: usize,
     pub symlink_behavior: SymlinkBehavior,
     pub allow_windows_reserved: bool,
+    pub max_path_len: usize,
 }
 
 impl PolicyConfig {
     /// Build a policy chain from this configuration.
     pub fn build(&self) -> Result<PolicyChain, Error> {
         Ok(PolicyChain::new()
-            .with(PathPolicy::new(&self.destination, false, self.allow_windows_reserved)?)
+            .with(PathPolicy::new(
+                &self.destination,
+                false,
+                self.allow_windows_reserved,
+                self.max_path_len,
+            )?)
             .with(SizePolicy::new(self.max_single_file, self.max_total))
             .with(CountPolicy::new(self.max_files))
             .with(DepthPolicy::new(self.max_depth))

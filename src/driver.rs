@@ -355,7 +355,12 @@ impl Driver {
     /// Build the policy chain from current settings.
     fn build_policies(&self) -> Result<PolicyChain, Error> {
         Ok(PolicyChain::new()
-            .with(PathPolicy::new(&self.destination, self.junk_paths, self.allow_windows_reserved)?)
+            .with(PathPolicy::new(
+                &self.destination,
+                self.junk_paths,
+                self.allow_windows_reserved,
+                self.limits.max_path_len,
+            )?)
             .with(SizePolicy::new(self.limits.max_single_file, self.limits.max_total_bytes))
             .with(CountPolicy::new(self.limits.max_file_count))
             .with(DepthPolicy::new(self.limits.max_path_depth))

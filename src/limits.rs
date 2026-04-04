@@ -11,6 +11,9 @@ pub struct Limits {
 
     /// Maximum directory depth. Default: 50.
     pub max_path_depth: usize,
+
+    /// Maximum path length
+    pub max_path_len: usize,
 }
 
 impl Default for Limits {
@@ -20,6 +23,13 @@ impl Default for Limits {
             max_file_count: 100_000,
             max_single_file: 4096 * 1024 * 1024, // 4 GiB
             max_path_depth: 50,
+
+            // Linux and other Unix systems
+            #[cfg(all(unix, not(target_os = "macos")))]
+            max_path_len: 4096,
+            // macOS and Windows
+            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            max_path_len: 1024,
         }
     }
 }

@@ -903,39 +903,37 @@ impl Extractor {
     }
 
     /// Validate filename. Returns Ok(()) if valid, Err(reason) if invalid.
-    fn validate_filename(&self, name: &str) -> Result<(), &'static str> {
-        // Reject empty names
+    fn validate_filename(&self, name: &str) -> Result<(), String> {
         if name.is_empty() {
-            return Err("empty filename");
+            return Err("empty filename".to_string());
         }
 
-        // Reject control characters (includes null bytes)
         if name.chars().any(|c| c.is_control()) {
-            return Err("contains control characters");
+            return Err("contains control characters".to_string());
         }
 
-        // Reject backslashes (Windows path separator could bypass Unix checks)
         if name.contains('\\') {
-            return Err("contains backslash");
+            return Err("contains backslash".to_string());
         }
 
-        // Reject extremely long filenames (filesystem limits)
-        if name.len() > 1024 {
-            return Err("path too long (>1024 bytes)");
+        if name.len() > self.limits.max_path_len {
+            return Err(format!(
+                "path too long ({}>{} bytes)",
+                name.len(),
+                self.limits.max_path_len
+            ));
         }
 
         if name.split('/').any(|component| component.len() > 255) {
-            return Err("path component too long (>255 bytes)");
+            return Err("path component too long (>255 bytes)".to_string());
         }
 
-        // Possibly check path components for reserved names
         if !self.allow_windows_reserved {
             let path = Path::new(name);
             for component in path.components() {
                 if let Component::Normal(os_str) = component
                     && let Some(s) = os_str.to_str()
                 {
-                    // Windows reserved names
                     let s_upper = s.to_ascii_uppercase();
                     let file_stem = s_upper.split('.').next().unwrap_or(&s_upper);
 
@@ -943,7 +941,7 @@ impl Extractor {
                         "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4"
                         | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3"
                         | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => {
-                            return Err("Windows reserved name");
+                            return Err("Windows reserved name".to_string()); // <-- Add .to_string()
                         }
                         _ => {}
                     }

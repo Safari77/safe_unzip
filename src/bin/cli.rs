@@ -95,6 +95,10 @@ struct Cli {
     #[arg(long)]
     max_depth: Option<usize>,
 
+    /// Maximumm path length
+    #[arg(long)]
+    max_path_len: Option<usize>,
+
     /// Restore file modification timestamps from the archive
     #[arg(long)]
     restore_timestamps: bool,
@@ -317,6 +321,7 @@ fn extract_zip(cli: &Cli, archive: &Path) -> Result<(), Error> {
         max_file_count: cli.max_files.unwrap_or(Limits::default().max_file_count),
         max_single_file: cli.max_single_file.unwrap_or(Limits::default().max_single_file),
         max_path_depth: cli.max_depth.unwrap_or(Limits::default().max_path_depth),
+        max_path_len: cli.max_path_len.unwrap_or(Limits::default().max_path_len),
     };
 
     let overwrite = match cli.overwrite {
@@ -400,6 +405,7 @@ fn extract_tar(cli: &Cli, archive: &Path, format: ArchiveFormat) -> Result<(), E
         max_file_count: cli.max_files.unwrap_or(Limits::default().max_file_count),
         max_single_file: cli.max_single_file.unwrap_or(Limits::default().max_single_file),
         max_path_depth: cli.max_depth.unwrap_or(Limits::default().max_path_depth),
+        max_path_len: cli.max_path_len.unwrap_or(Limits::default().max_path_len),
     };
 
     let overwrite_mode = match cli.overwrite {
@@ -506,6 +512,7 @@ fn extract_sevenz(cli: &Cli, archive: &Path) -> Result<(), Error> {
         max_file_count: cli.max_files.unwrap_or(Limits::default().max_file_count),
         max_single_file: cli.max_single_file.unwrap_or(Limits::default().max_single_file),
         max_path_depth: cli.max_depth.unwrap_or(Limits::default().max_path_depth),
+        max_path_len: cli.max_path_len.unwrap_or(Limits::default().max_path_len),
     };
 
     // Map policies to Driver types
