@@ -33,7 +33,7 @@ clap = { version = "4", features = ["derive"], optional = true }
 clap_complete = { version = "4", optional = true }
 zip = { version = "8", default-features = false, features = ["deflate", "deflate64", "lzma", "time", "chrono", "aes-crypto"] }
 tar = { version = "0.4", optional = true }
-flate2 = { version = "1", optional = true }  # For .tar.gz support
+flate2 = { version = "1", optional = true, default-features = false, features = ["miniz_oxide"] }  # For .tar.gz support
 glob-match = "0.2"  # For include/exclude patterns
 sevenz-rust2 = { version = "0", optional = true }  # For 7z support
 tempfile = { version = "3", optional = true }  # For 7z from bytes
