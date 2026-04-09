@@ -9,9 +9,6 @@ use cap_std::fs_utf8::{Dir, OpenOptions};
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 
-#[cfg(unix)]
-use cap_std::fs::PermissionsExt;
-
 use crate::Progress;
 #[cfg(feature = "tar")]
 use crate::adapter::TarAdapter;
@@ -186,6 +183,68 @@ impl Driver {
         })
     }
 
+    /// Ensures directories are created for the entry (and caches them).
+    fn prepare_entry_paths(
+        &self,
+        info: &EntryInfo,
+        safe_path: &str,
+        state: &mut ExtractionState,
+    ) -> Result<(), Error> {
+        match info.kind {
+            EntryKind::Directory => {
+                if state.created_dirs_cache.insert(safe_path.to_string()) {
+                    crate::entry::ensure_directory(
+                        &self.dir,
+                        safe_path,
+                        self.dir_mode.or(info.mode),
+                    )?;
+                    state.dirs_created += 1;
+                }
+            }
+            EntryKind::File => {
+                if !self.junk_paths
+                    && let Some(parent) = camino::Utf8Path::new(safe_path).parent()
+                    && !parent.as_str().is_empty()
+                {
+                    let parent_str = parent.as_str();
+                    if state.created_dirs_cache.insert(parent_str.to_string()) {
+                        crate::entry::ensure_directory(&self.dir, parent_str, self.dir_mode)?;
+                    }
+                }
+            }
+            EntryKind::Symlink { .. } => {}
+        }
+        Ok(())
+    }
+
+    /// Finalizes file extraction securely via the open File Descriptor
+    fn finalize_file(
+        &self,
+        outfile: cap_std::fs_utf8::File,
+        info: &EntryInfo,
+    ) -> Result<(), Error> {
+        let std_outfile = outfile.into_std();
+
+        #[cfg(unix)]
+        {
+            if let Some(mode) = self.file_mode.or(info.mode) {
+                use std::os::unix::fs::PermissionsExt;
+                let safe_mode = mode & 0o0777;
+                std_outfile.set_permissions(std::fs::Permissions::from_mode(safe_mode))?;
+            }
+        }
+
+        if self.fsync {
+            std_outfile.sync_all()?;
+        }
+
+        if self.restore_timestamps {
+            crate::entry::restore_file_times(std_outfile, info.mtime, &info.name);
+        }
+
+        Ok(())
+    }
+
     pub fn allow_windows_reserved(mut self, allow: bool) -> Self {
         self.allow_windows_reserved = allow;
         self
@@ -264,35 +323,6 @@ impl Driver {
         } else {
             name.to_owned()
         }
-    }
-
-    // Applying permission overrides
-    #[cfg(unix)]
-    fn apply_permissions(
-        &self,
-        path: &str,
-        info_mode: Option<u32>,
-        is_dir: bool,
-    ) -> Result<(), Error> {
-        let override_mode = if is_dir { self.dir_mode } else { self.file_mode };
-
-        #[cfg(unix)]
-        if let Some(mode) = override_mode.or(info_mode) {
-            let safe_mode = mode & 0o0777;
-            self.dir.set_permissions(path, cap_std::fs::Permissions::from_mode(safe_mode))?;
-        }
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    fn apply_permissions(
-        &self,
-        _path: &str, // Prefix with underscore to silence unused warning
-        _info_mode: Option<u32>,
-        _is_dir: bool,
-    ) -> Result<(), Error> {
-        // File permissions like 0o755 don't translate directly to Windows natively in std/cap-std.
-        Ok(())
     }
 
     /// Extract only specific files by exact name.
@@ -450,104 +480,26 @@ impl Driver {
         }
 
         let safe_path = self.resolve_path(&info.name);
+        self.prepare_entry_paths(&info, &safe_path, state)?;
 
-        // Extract based on entry type
-        match info.kind {
-            EntryKind::Directory => {
-                // For directories, just create (idempotent)
-                crate::entry::ensure_directory(&self.dir, &safe_path, self.dir_mode.or(info.mode))?;
-                state.dirs_created += 1;
+        if matches!(info.kind, EntryKind::File) {
+            let Some((mut outfile, actual_path)) = self.open_for_write(&safe_path, state)? else {
+                return Ok(()); // Skipped due to policy
+            };
+
+            let limit = self
+                .limits
+                .max_single_file
+                .min(self.limits.max_total_bytes.saturating_sub(state.bytes_written));
+            let (_, written) = adapter.extract_to(index, &mut outfile, limit)?;
+
+            self.finalize_file(outfile, &info)?;
+
+            if actual_path != safe_path {
+                state.renames.push((safe_path, actual_path));
             }
-            EntryKind::File => {
-                if !self.junk_paths
-                    && let Some(parent) = camino::Utf8Path::new(&safe_path).parent()
-                    && !parent.as_str().is_empty()
-                {
-                    crate::entry::ensure_directory(&self.dir, parent.as_str(), self.dir_mode)?;
-                }
-
-                // Atomic file creation based on overwrite mode
-                let mut actual_path = safe_path.clone();
-                let outfile = match self.overwrite {
-                    OverwriteMode::Error => {
-                        match self.dir.open_with(
-                            &actual_path,
-                            OpenOptions::new().write(true).create_new(true),
-                        ) {
-                            Ok(f) => f,
-                            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                                return Err(Error::AlreadyExists { entry: actual_path });
-                            }
-                            Err(e) => return Err(e.into()),
-                        }
-                    }
-                    OverwriteMode::Skip => {
-                        match self.dir.open_with(
-                            &actual_path,
-                            OpenOptions::new().write(true).create_new(true),
-                        ) {
-                            Ok(f) => f,
-                            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                                state.entries_skipped += 1;
-                                return Ok(());
-                            }
-                            Err(e) => return Err(e.into()),
-                        }
-                    }
-                    OverwriteMode::Overwrite => {
-                        if let Ok(m) = self.dir.symlink_metadata(&actual_path)
-                            && m.file_type().is_symlink()
-                        {
-                            let _ = self.dir.remove_file(&actual_path);
-                        }
-                        self.dir.create(&actual_path)?
-                    }
-                    OverwriteMode::RenameBase | OverwriteMode::RenameExt => {
-                        let (f, new_path) = self.open_with_rename(&actual_path)?;
-                        actual_path = new_path;
-                        f
-                    }
-                };
-
-                let mut outfile = outfile;
-                let limit = self
-                    .limits
-                    .max_single_file
-                    .min(self.limits.max_total_bytes.saturating_sub(state.bytes_written));
-
-                let (_, written) = adapter.extract_to(index, &mut outfile, limit)?;
-
-                let std_outfile = outfile.into_std();
-
-                // 1. PERMISSIONS: Apply via the open File Descriptor (avoids TOC-TOU)
-                #[cfg(unix)]
-                {
-                    if let Some(mode) = self.file_mode.or(info.mode) {
-                        use std::os::unix::fs::PermissionsExt;
-                        let safe_mode = mode & 0o0777;
-                        std_outfile.set_permissions(std::fs::Permissions::from_mode(safe_mode))?;
-                    }
-                }
-
-                // 2. FSYNC: Flush data and metadata to disk
-                if self.fsync {
-                    std_outfile.sync_all()?;
-                }
-
-                // 3. TIMESTAMPS: Consumes and securely closes the File Descriptor
-                if self.restore_timestamps {
-                    crate::entry::restore_file_times(std_outfile, info.mtime, &info.name);
-                }
-
-                if actual_path != safe_path {
-                    state.renames.push((safe_path.clone(), actual_path.clone()));
-                }
-                state.bytes_written += written;
-                state.files_extracted += 1;
-            }
-            EntryKind::Symlink { .. } => {
-                // Already handled above (skipped or errored by policy)
-            }
+            state.bytes_written += written;
+            state.files_extracted += 1;
         }
 
         Ok(())
@@ -680,50 +632,28 @@ impl Driver {
         }
 
         let safe_path = self.resolve_path(&info.name);
+        self.prepare_entry_paths(info, &safe_path, state)?;
 
-        match info.kind {
-            EntryKind::Directory => {
-                crate::entry::ensure_directory(&self.dir, &safe_path, self.dir_mode.or(info.mode))?;
-                state.dirs_created += 1;
+        if matches!(info.kind, EntryKind::File) {
+            let Some((mut outfile, actual_path)) = self.open_for_write(&safe_path, state)? else {
+                return Ok(());
+            };
+
+            if let Some(reader) = reader {
+                let limit = self
+                    .limits
+                    .max_single_file
+                    .min(self.limits.max_total_bytes.saturating_sub(state.bytes_written));
+                let written = crate::adapter::copy_limited(reader, &mut outfile, limit)?;
+                state.bytes_written += written;
             }
-            EntryKind::File => {
-                if !self.junk_paths
-                    && let Some(parent) = camino::Utf8Path::new(&safe_path).parent()
-                    && !parent.as_str().is_empty()
-                {
-                    crate::entry::ensure_directory(&self.dir, parent.as_str(), self.dir_mode)?;
-                }
 
-                let outfile_result = self.open_for_write(&safe_path, state)?;
-                let Some((mut outfile, actual_path)) = outfile_result else {
-                    return Ok(()); // Skipped
-                };
-                if actual_path != safe_path {
-                    state.renames.push((safe_path.clone(), actual_path.clone()));
-                }
+            self.finalize_file(outfile, info)?;
 
-                if let Some(reader) = reader {
-                    let limit = self
-                        .limits
-                        .max_single_file
-                        .min(self.limits.max_total_bytes.saturating_sub(state.bytes_written));
-                    let written = crate::adapter::copy_limited(reader, &mut outfile, limit)?;
-                    state.bytes_written += written;
-                }
-
-                if self.fsync {
-                    outfile.sync_all()?;
-                }
-                self.apply_permissions(&actual_path, info.mode, false)?;
-                if self.restore_timestamps {
-                    crate::entry::restore_file_times(outfile.into_std(), info.mtime, &info.name);
-                }
-
-                state.files_extracted += 1;
+            if actual_path != safe_path {
+                state.renames.push((safe_path, actual_path));
             }
-            EntryKind::Symlink { .. } => {
-                // Already handled
-            }
+            state.files_extracted += 1;
         }
 
         Ok(())
@@ -761,47 +691,25 @@ impl Driver {
         }
 
         let safe_path = self.resolve_path(&info.name);
+        self.prepare_entry_paths(info, &safe_path, state)?;
 
-        match info.kind {
-            EntryKind::Directory => {
-                crate::entry::ensure_directory(&self.dir, &safe_path, self.dir_mode)?;
-                state.dirs_created += 1;
+        if matches!(info.kind, EntryKind::File) {
+            let Some((mut outfile, actual_path)) = self.open_for_write(&safe_path, state)? else {
+                return Ok(());
+            };
+
+            if let Some(data) = data {
+                use std::io::Write;
+                outfile.write_all(data)?;
+                state.bytes_written += data.len() as u64;
             }
-            EntryKind::File => {
-                if !self.junk_paths
-                    && let Some(parent) = camino::Utf8Path::new(&safe_path).parent()
-                    && !parent.as_str().is_empty()
-                {
-                    crate::entry::ensure_directory(&self.dir, parent.as_str(), self.dir_mode)?;
-                }
 
-                let outfile_result = self.open_for_write(&safe_path, state)?;
-                let Some((mut outfile, actual_path)) = outfile_result else {
-                    return Ok(()); // Skipped
-                };
-                if actual_path != safe_path {
-                    state.renames.push((safe_path.clone(), actual_path.clone()));
-                }
+            self.finalize_file(outfile, info)?;
 
-                if let Some(data) = data {
-                    use std::io::Write;
-                    outfile.write_all(data)?;
-                    state.bytes_written += data.len() as u64;
-                }
-
-                if self.fsync {
-                    outfile.sync_all()?;
-                }
-                self.apply_permissions(&actual_path, info.mode, false)?;
-                if self.restore_timestamps {
-                    crate::entry::restore_file_times(outfile.into_std(), info.mtime, &info.name);
-                }
-
-                state.files_extracted += 1;
+            if actual_path != safe_path {
+                state.renames.push((safe_path, actual_path));
             }
-            EntryKind::Symlink { .. } => {
-                // Already handled
-            }
+            state.files_extracted += 1;
         }
 
         Ok(())
@@ -809,7 +717,6 @@ impl Driver {
 
     /// Open a file for writing based on overwrite policy.
     /// Returns None if the file should be skipped.
-    #[cfg(feature = "tar")]
     fn open_for_write(
         &self,
         path: &str,
@@ -936,47 +843,25 @@ impl Driver {
         }
 
         let safe_path = self.resolve_path(&info.name);
+        self.prepare_entry_paths(info, &safe_path, state)?;
 
-        match info.kind {
-            EntryKind::Directory => {
-                crate::entry::ensure_directory(&self.dir, &safe_path, self.dir_mode.or(info.mode))?;
-                state.dirs_created += 1;
+        if matches!(info.kind, EntryKind::File) {
+            let Some((mut outfile, actual_path)) = self.open_for_write(&safe_path, state)? else {
+                return Ok(());
+            };
+
+            if let Some(bytes) = data {
+                use std::io::Write;
+                outfile.write_all(bytes)?;
+                state.bytes_written += bytes.len() as u64;
             }
-            EntryKind::File => {
-                if !self.junk_paths
-                    && let Some(parent) = camino::Utf8Path::new(&safe_path).parent()
-                    && !parent.as_str().is_empty()
-                {
-                    crate::entry::ensure_directory(&self.dir, parent.as_str(), self.dir_mode)?;
-                }
 
-                let outfile_result = self.open_for_write(&safe_path, state)?;
-                let Some((mut outfile, actual_path)) = outfile_result else {
-                    return Ok(()); // Skipped
-                };
-                if actual_path != safe_path {
-                    state.renames.push((safe_path.clone(), actual_path.clone()));
-                }
+            self.finalize_file(outfile, info)?;
 
-                if let Some(bytes) = data {
-                    use std::io::Write;
-                    outfile.write_all(bytes)?;
-                    state.bytes_written += bytes.len() as u64;
-                }
-                if self.fsync {
-                    outfile.sync_all()?;
-                }
-                self.apply_permissions(&actual_path, info.mode, false)?;
-                if self.restore_timestamps {
-                    crate::entry::restore_file_times(outfile.into_std(), info.mtime, &info.name);
-                }
-
-                state.files_extracted += 1;
+            if actual_path != safe_path {
+                state.renames.push((safe_path, actual_path));
             }
-            EntryKind::Symlink { .. } => {
-                // Skip symlinks for 7z (same policy as TAR)
-                state.entries_skipped += 1;
-            }
+            state.files_extracted += 1;
         }
 
         Ok(())

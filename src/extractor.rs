@@ -398,6 +398,7 @@ impl Extractor {
         let mut report = Report::default();
         let mut total_bytes_written: u64 = 0;
         let total_entries = archive.len();
+        let mut created_dirs = std::collections::HashSet::new();
 
         for i in 0..total_entries {
             let mut entry = match &self.password {
@@ -518,18 +519,23 @@ impl Extractor {
 
             // 7. EXECUTION
             if entry.is_dir() {
-                crate::entry::ensure_directory(
-                    &self.dir,
-                    &safe_relative_path,
-                    self.dir_mode.or_else(|| entry.unix_mode()),
-                )?;
-                report.dirs_created += 1;
+                if created_dirs.insert(safe_relative_path.clone()) {
+                    crate::entry::ensure_directory(
+                        &self.dir,
+                        &safe_relative_path,
+                        self.dir_mode.or_else(|| entry.unix_mode()),
+                    )?;
+                    report.dirs_created += 1;
+                }
             } else {
                 if !self.junk_paths
                     && let Some(parent) = camino::Utf8Path::new(&safe_relative_path).parent()
                     && !parent.as_str().is_empty()
                 {
-                    crate::entry::ensure_directory(&self.dir, parent.as_str(), self.dir_mode)?;
+                    let parent_str = parent.as_str();
+                    if created_dirs.insert(parent_str.to_string()) {
+                        crate::entry::ensure_directory(&self.dir, parent_str, self.dir_mode)?;
+                    }
                 }
 
                 // SECURITY: Atomic file creation based on overwrite policy utilizing openat2 under the hood

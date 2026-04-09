@@ -3,6 +3,7 @@
 //! Policies validate entries before they are extracted, providing
 //! protection against various archive-based attacks.
 
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 use crate::entry::{EntryInfo, EntryKind};
@@ -21,6 +22,8 @@ pub struct ExtractionState {
     pub entries_skipped: usize,
     /// Tracking renames with --overwrite rename-{base,ext}
     pub renames: Vec<(String, String)>,
+    /// Cache to track created directories and avoid redundant syscalls.
+    pub created_dirs_cache: HashSet<String>,
 }
 
 /// A security policy that validates entries before extraction.
