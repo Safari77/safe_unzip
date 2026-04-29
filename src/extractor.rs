@@ -84,6 +84,14 @@ pub enum ExtractionMode {
     ValidateFirst,
 }
 
+/// For verbose logging: created, overwritten, or skipped files / dirs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryAction {
+    Created,
+    Overwritten,
+    Skipped,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Report {
     pub files_extracted: usize,
@@ -126,6 +134,8 @@ pub struct Progress {
     pub bytes_written: u64,
     /// Files extracted so far.
     pub files_extracted: usize,
+    /// The action taken for this entry.
+    pub action: EntryAction,
 }
 
 pub struct Extractor {
@@ -407,18 +417,6 @@ impl Extractor {
             };
             let name = entry.name().to_string();
 
-            // Call progress callback if set
-            if let Some(ref callback) = self.on_progress {
-                callback(&Progress {
-                    entry_name: name.clone(),
-                    entry_size: entry.size(),
-                    entry_index: i,
-                    total_entries,
-                    bytes_written: total_bytes_written,
-                    files_extracted: report.files_extracted,
-                });
-            }
-
             // 0. SECURITY: Filename Sanitization
             if let Err(reason) = self.validate_filename(&name) {
                 return Err(Error::InvalidFilename { entry: name, reason: reason.to_string() });
@@ -438,6 +436,18 @@ impl Extractor {
                 name.clone()
             };
 
+            let mtime = crate::adapter::zip_adapter::zip_time_to_timestamp(entry.last_modified());
+            let info = EntryInfo {
+                name: &name,
+                size: entry.size(),
+                compressed_size: entry.compressed_size(),
+                is_dir: entry.is_dir(),
+                is_symlink: entry.is_symlink(),
+                mtime,
+            };
+
+            let mut skipped = false;
+
             // 2. CHECK: Symlinks
             if entry.is_symlink() {
                 match self.symlinks {
@@ -447,20 +457,61 @@ impl Extractor {
                             target: String::new(), // ZIP symlink targets require reading content
                         });
                     }
-                    SymlinkPolicy::Skip => {
-                        report.entries_skipped += 1;
-                        continue;
-                    }
+                    SymlinkPolicy::Skip => skipped = true,
                 }
             }
 
             // 2.5 CHECK: Junk Paths (Skip Directories)
             if self.junk_paths && entry.is_dir() {
+                skipped = true;
+            }
+
+            // 3. CHECK: Filter (User Logic)
+            if !skipped
+                && let Some(ref filter) = self.filter
+                    && !filter(&info) {
+                        skipped = true;
+                    }
+
+            // Check if file already exists
+            let exists = self.dir.symlink_metadata(&safe_relative_path).is_ok();
+
+            // 3.5 CHECK: Existing file for OverwritePolicy::Skip
+            if !skipped && !entry.is_dir() && matches!(self.overwrite, OverwritePolicy::Skip)
+                && exists {
+                    skipped = true;
+                }
+
+            let action = if skipped {
+                EntryAction::Skipped
+            } else if exists
+                && !entry.is_dir()
+                && matches!(self.overwrite, OverwritePolicy::Overwrite)
+            {
+                EntryAction::Overwritten
+            } else {
+                EntryAction::Created
+            };
+
+            // Call progress callback
+            if let Some(ref callback) = self.on_progress {
+                callback(&Progress {
+                    entry_name: name.clone(),
+                    entry_size: entry.size(),
+                    entry_index: i,
+                    total_entries,
+                    bytes_written: total_bytes_written,
+                    files_extracted: report.files_extracted,
+                    action,
+                });
+            }
+
+            if skipped {
                 report.entries_skipped += 1;
                 continue;
             }
 
-            // 3. CHECK: Limits (Depth)
+            // 4. CHECK: Limits (Depth)
             // Count normal components to check depth
             let depth =
                 Path::new(&name).components().filter(|c| matches!(c, Component::Normal(_))).count();
@@ -472,25 +523,6 @@ impl Extractor {
                 });
             }
 
-            let mtime = crate::adapter::zip_adapter::zip_time_to_timestamp(entry.last_modified());
-            // 4. CHECK: Filter (User Logic)
-            let info = EntryInfo {
-                name: &name,
-                size: entry.size(),
-                compressed_size: entry.compressed_size(),
-                is_dir: entry.is_dir(),
-                is_symlink: entry.is_symlink(),
-                mtime,
-            };
-
-            if let Some(ref filter) = self.filter
-                && !filter(&info)
-            {
-                report.entries_skipped += 1;
-                continue;
-            }
-
-            // 5. CHECK: Limits (Count & Lookahead Total)
             // Check directory count
             if entry.is_dir() && report.dirs_created >= self.limits.max_dir_count {
                 return Err(Error::DirCountExceeded {
@@ -517,7 +549,6 @@ impl Extractor {
             }
 
             // Check total size (Lookahead declared)
-            // Note: We ALSO check this during streaming to prevent zip bombs that lie about size
             if total_bytes_written + entry.size() > self.limits.max_total_bytes {
                 return Err(Error::TotalSizeExceeded {
                     limit: self.limits.max_total_bytes,
@@ -663,39 +694,26 @@ impl Extractor {
                 let mut limiter = LimitReader::new(&mut entry, hard_limit);
                 let mut outfile = outfile;
 
-                // We use io::copy, which loops until EOF or error.
-                // LimitReader returns EOF at limit.
-                // BUT we need to distinguish EOF at limit vs natural EOF.
-                // If EOF at limit AND entry has more data -> Error.
-
                 let mut buffer = [0u8; 65536];
                 let mut written = 0;
 
                 loop {
                     let len = limiter.read(&mut buffer)?;
                     if len == 0 {
-                        break; // Reached EOF or hit the security limit
+                        break;
                     }
                     outfile.write_all(&buffer[..len])?;
                     written += len as u64;
                 }
 
-                // Check if we hit the limit strictly
                 if limiter.hit_limit {
-                    // If we hit the limit, we must check if there was MORE data expected.
-                    // If declared size > written, we stopped early -> OK?
-                    // No, if we stopped because of max_single_file, it's an error if the file was larger.
-                    // If we stopped because of max_total_bytes, it's an error.
-                    // If we stopped because of entry.size(), it's fine (just consumed declared).
-
-                    // Actually, if we hit the hard_limit, we should check WHY.
                     if written >= self.limits.max_single_file
                         && entry.size() > self.limits.max_single_file
                     {
                         return Err(Error::FileTooLarge {
                             entry: name,
                             limit: self.limits.max_single_file,
-                            size: written + 1, // At least this much
+                            size: written + 1,
                         });
                     }
 
@@ -705,22 +723,16 @@ impl Extractor {
                             would_be: total_bytes_written + written + 1,
                         });
                     }
-
-                    // Specific check: if written == entry.size(), we are good.
-                    // If written < entry.size() but we hit limit, it means limit < entry.size().
-                    // Which implies one of the above errors triggered.
                 }
 
                 // SECURITY: Detect zip bombs that lie about declared size.
-                // If we wrote exactly the declared size, check if there's more data.
-                // If so, the file is larger than declared (potential zip bomb).
                 if written == entry.size() {
                     let mut buf = [0u8; 1];
                     if entry.read(&mut buf)? > 0 {
                         return Err(Error::SizeMismatch {
                             entry: name.clone(),
                             declared: entry.size(),
-                            actual: entry.size() + 1, // At least this much more
+                            actual: entry.size() + 1,
                         });
                     }
                 }
@@ -798,10 +810,7 @@ impl Extractor {
 
             // 2. Symlink check
             if entry.is_symlink() && matches!(self.symlinks, SymlinkPolicy::Error) {
-                return Err(Error::SymlinkNotAllowed {
-                    entry: name,
-                    target: String::new(), // ZIP symlink targets require reading content
-                });
+                return Err(Error::SymlinkNotAllowed { entry: name, target: String::new() });
             }
 
             // 3. Path depth check
@@ -903,12 +912,10 @@ impl Extractor {
             let mut entry = archive.by_index(i)?;
             let name = entry.name().to_string();
 
-            // Check for encrypted entries
             if entry.encrypted() && self.password.is_none() {
                 return Err(Error::EncryptedEntry { entry: name });
             }
 
-            // Skip directories and symlinks
             if entry.is_dir() || entry.is_symlink() {
                 continue;
             }
@@ -987,7 +994,7 @@ impl Extractor {
                         "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4"
                         | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3"
                         | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => {
-                            return Err("Windows reserved name".to_string()); // <-- Add .to_string()
+                            return Err("Windows reserved name".to_string());
                         }
                         _ => {}
                     }

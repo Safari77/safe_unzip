@@ -15,6 +15,7 @@ use crate::adapter::TarAdapter;
 use crate::adapter::ZipAdapter;
 use crate::entry::{EntryInfo, EntryKind};
 use crate::error::Error;
+use crate::extractor::EntryAction;
 use crate::limits::Limits;
 use crate::policy::{
     CountPolicy, DepthPolicy, ExtractionState, PathPolicy, PolicyChain, SizePolicy,
@@ -189,7 +190,7 @@ impl Driver {
         })
     }
 
-    // Update prepare_entry_paths to check dir limits dynamically
+    /// Ensures directories are created for the entry (and caches them).
     fn prepare_entry_paths(
         &self,
         info: &EntryInfo,
@@ -227,7 +228,7 @@ impl Driver {
                             });
                         }
                         crate::entry::ensure_directory(&self.dir, parent_str, self.dir_mode)?;
-                        state.dirs_created += 1; // Increment here!
+                        state.dirs_created += 1;
                     }
                 }
             }
@@ -429,9 +430,10 @@ impl Driver {
         }
 
         let mut state = ExtractionState::default();
+        let total_entries = adapter.len();
 
-        for i in 0..adapter.len() {
-            self.extract_zip_entry(&mut adapter, i, &policies, &mut state)?;
+        for i in 0..total_entries {
+            self.extract_zip_entry(&mut adapter, i, &policies, &mut state, total_entries)?;
         }
 
         Ok(ExtractionReport {
@@ -459,7 +461,10 @@ impl Driver {
             if matches!(info.kind, EntryKind::File) {
                 state.bytes_written += info.size;
                 state.files_extracted += 1;
-            }
+            } else if matches!(info.kind, EntryKind::Directory)
+                && !self.junk_paths {
+                    state.dirs_created += 1;
+                }
         }
 
         Ok(())
@@ -472,38 +477,69 @@ impl Driver {
         index: usize,
         policies: &PolicyChain,
         state: &mut ExtractionState,
+        total_entries: usize,
     ) -> Result<(), Error> {
         let info = adapter.entry_info(index)?;
+        let mut skipped = false;
 
-        // Apply filter
+        // Apply filters & skip rules
         if let Some(ref filter) = self.filter
-            && !filter(&info)
+            && !filter(&info) {
+                skipped = true;
+            }
+        if matches!(info.kind, EntryKind::Symlink { .. }) && self.symlinks == SymlinkBehavior::Skip
         {
-            state.entries_skipped += 1;
-            return Ok(());
+            skipped = true;
         }
-
-        // Check policies
-        policies.check_all(&info, state)?;
-
-        // Handle symlinks (skip by default, policy may error)
-        if matches!(info.kind, EntryKind::Symlink { .. }) {
-            state.entries_skipped += 1;
-            return Ok(());
-        }
-
-        // Skip directory entries if junk_paths is enabled ---
         if self.junk_paths && matches!(info.kind, EntryKind::Directory) {
-            state.entries_skipped += 1;
-            return Ok(());
+            skipped = true;
         }
 
         let safe_path = self.resolve_path(&info.name);
+        let exists = self.dir.symlink_metadata(&safe_path).is_ok();
+
+        if !skipped
+            && matches!(info.kind, EntryKind::File)
+            && matches!(self.overwrite, OverwriteMode::Skip)
+            && exists {
+                skipped = true;
+            }
+
+        let action = if skipped {
+            EntryAction::Skipped
+        } else if exists
+            && matches!(info.kind, EntryKind::File)
+            && matches!(self.overwrite, OverwriteMode::Overwrite)
+        {
+            EntryAction::Overwritten
+        } else {
+            EntryAction::Created
+        };
+
+        if let Some(ref cb) = self.on_progress {
+            cb(&Progress {
+                entry_name: info.name.clone(),
+                entry_size: info.size,
+                entry_index: index,
+                total_entries,
+                bytes_written: state.bytes_written,
+                files_extracted: state.files_extracted,
+                action,
+            });
+        }
+
+        if skipped {
+            state.entries_skipped += 1;
+            return Ok(());
+        }
+
+        // Check policies (enforces size/count limits, and SymlinkBehavior::Error if not skipped)
+        policies.check_all(&info, state)?;
         self.prepare_entry_paths(&info, &safe_path, state)?;
 
         if matches!(info.kind, EntryKind::File) {
             let Some((mut outfile, actual_path)) = self.open_for_write(&safe_path, state)? else {
-                return Ok(()); // Skipped due to policy
+                return Ok(());
             };
 
             let limit = self
@@ -556,7 +592,10 @@ impl Driver {
                 if matches!(info.kind, EntryKind::File) {
                     state.bytes_written += info.size;
                     state.files_extracted += 1;
-                }
+                } else if matches!(info.kind, EntryKind::Directory)
+                    && !self.junk_paths {
+                        state.dirs_created += 1;
+                    }
             }
 
             // Extract from cache
@@ -564,19 +603,15 @@ impl Driver {
             let mut entry_index = 0;
 
             adapter.extract_cached(|info, data| {
-                if let Some(ref cb) = self.on_progress {
-                    cb(&Progress {
-                        entry_name: info.name.clone(),
-                        entry_size: info.size,
-                        entry_index,
-                        total_entries,
-                        bytes_written: state.bytes_written,
-                        files_extracted: state.files_extracted,
-                    });
-                }
-                self.extract_tar_entry_data(&info, data, &policies, &mut state)?;
+                self.extract_tar_entry_data(
+                    &info,
+                    data,
+                    &policies,
+                    &mut state,
+                    entry_index,
+                    total_entries,
+                )?;
                 entry_index += 1;
-
                 Ok(true)
             })?;
 
@@ -594,18 +629,7 @@ impl Driver {
         let mut entry_index = 0;
 
         adapter.for_each(|info, reader| {
-            if let Some(ref cb) = self.on_progress {
-                cb(&Progress {
-                    entry_name: info.name.clone(),
-                    entry_size: info.size,
-                    entry_index,
-                    total_entries: 0, // Unknown for streaming TAR
-                    bytes_written: state.bytes_written,
-                    files_extracted: state.files_extracted,
-                });
-            }
-
-            self.extract_tar_entry(&info, reader, &policies, &mut state)?;
+            self.extract_tar_entry(&info, reader, &policies, &mut state, entry_index, 0)?;
             entry_index += 1;
             Ok(true)
         })?;
@@ -627,30 +651,62 @@ impl Driver {
         reader: Option<&mut dyn Read>,
         policies: &PolicyChain,
         state: &mut ExtractionState,
+        entry_index: usize,
+        total_entries: usize,
     ) -> Result<(), Error> {
-        // Apply filter
+        let mut skipped = false;
+
         if let Some(ref filter) = self.filter
-            && !filter(info)
+            && !filter(info) {
+                skipped = true;
+            }
+        if matches!(info.kind, EntryKind::Symlink { .. }) && self.symlinks == SymlinkBehavior::Skip
         {
-            state.entries_skipped += 1;
-            return Ok(());
+            skipped = true;
         }
-
-        // Check policies
-        policies.check_all(info, state)?;
-
-        // Handle symlinks
-        if matches!(info.kind, EntryKind::Symlink { .. }) {
-            state.entries_skipped += 1;
-            return Ok(());
-        }
-
         if self.junk_paths && matches!(info.kind, EntryKind::Directory) {
-            state.entries_skipped += 1;
-            return Ok(());
+            skipped = true;
         }
 
         let safe_path = self.resolve_path(&info.name);
+        let exists = self.dir.symlink_metadata(&safe_path).is_ok();
+
+        if !skipped
+            && matches!(info.kind, EntryKind::File)
+            && matches!(self.overwrite, OverwriteMode::Skip)
+            && exists {
+                skipped = true;
+            }
+
+        let action = if skipped {
+            EntryAction::Skipped
+        } else if exists
+            && matches!(info.kind, EntryKind::File)
+            && matches!(self.overwrite, OverwriteMode::Overwrite)
+        {
+            EntryAction::Overwritten
+        } else {
+            EntryAction::Created
+        };
+
+        if let Some(ref cb) = self.on_progress {
+            cb(&Progress {
+                entry_name: info.name.clone(),
+                entry_size: info.size,
+                entry_index,
+                total_entries,
+                bytes_written: state.bytes_written,
+                files_extracted: state.files_extracted,
+                action,
+            });
+        }
+
+        if skipped {
+            state.entries_skipped += 1;
+            return Ok(());
+        }
+
+        policies.check_all(info, state)?;
         self.prepare_entry_paths(info, &safe_path, state)?;
 
         if matches!(info.kind, EntryKind::File) {
@@ -686,30 +742,62 @@ impl Driver {
         data: Option<&[u8]>,
         policies: &PolicyChain,
         state: &mut ExtractionState,
+        entry_index: usize,
+        total_entries: usize,
     ) -> Result<(), Error> {
-        // Apply filter
+        let mut skipped = false;
+
         if let Some(ref filter) = self.filter
-            && !filter(info)
+            && !filter(info) {
+                skipped = true;
+            }
+        if matches!(info.kind, EntryKind::Symlink { .. }) && self.symlinks == SymlinkBehavior::Skip
         {
-            state.entries_skipped += 1;
-            return Ok(());
+            skipped = true;
         }
-
         if self.junk_paths && matches!(info.kind, EntryKind::Directory) {
-            state.entries_skipped += 1;
-            return Ok(());
-        }
-
-        // Check policies (already validated, but need for state updates)
-        policies.check_all(info, state)?;
-
-        // Handle symlinks
-        if matches!(info.kind, EntryKind::Symlink { .. }) {
-            state.entries_skipped += 1;
-            return Ok(());
+            skipped = true;
         }
 
         let safe_path = self.resolve_path(&info.name);
+        let exists = self.dir.symlink_metadata(&safe_path).is_ok();
+
+        if !skipped
+            && matches!(info.kind, EntryKind::File)
+            && matches!(self.overwrite, OverwriteMode::Skip)
+            && exists {
+                skipped = true;
+            }
+
+        let action = if skipped {
+            EntryAction::Skipped
+        } else if exists
+            && matches!(info.kind, EntryKind::File)
+            && matches!(self.overwrite, OverwriteMode::Overwrite)
+        {
+            EntryAction::Overwritten
+        } else {
+            EntryAction::Created
+        };
+
+        if let Some(ref cb) = self.on_progress {
+            cb(&Progress {
+                entry_name: info.name.clone(),
+                entry_size: info.size,
+                entry_index,
+                total_entries,
+                bytes_written: state.bytes_written,
+                files_extracted: state.files_extracted,
+                action,
+            });
+        }
+
+        if skipped {
+            state.entries_skipped += 1;
+            return Ok(());
+        }
+
+        policies.check_all(info, state)?;
         self.prepare_entry_paths(info, &safe_path, state)?;
 
         if matches!(info.kind, EntryKind::File) {
@@ -812,17 +900,7 @@ impl Driver {
         let mut entry_index = 0;
 
         adapter.for_each(|info, data| {
-            if let Some(ref cb) = self.on_progress {
-                cb(&Progress {
-                    entry_name: info.name.clone(),
-                    entry_size: info.size,
-                    entry_index,
-                    total_entries,
-                    bytes_written: state.bytes_written,
-                    files_extracted: state.files_extracted,
-                });
-            }
-            self.extract_7z_entry(info, data, &policies, &mut state)?;
+            self.extract_7z_entry(info, data, &policies, &mut state, entry_index, total_entries)?;
             entry_index += 1;
             Ok(true)
         })?;
@@ -844,24 +922,62 @@ impl Driver {
         data: Option<&[u8]>,
         policies: &PolicyChain,
         state: &mut ExtractionState,
+        entry_index: usize,
+        total_entries: usize,
     ) -> Result<(), Error> {
-        // Apply filter
+        let mut skipped = false;
+
         if let Some(ref filter) = self.filter
-            && !filter(info)
+            && !filter(info) {
+                skipped = true;
+            }
+        if matches!(info.kind, EntryKind::Symlink { .. }) && self.symlinks == SymlinkBehavior::Skip
         {
-            state.entries_skipped += 1;
-            return Ok(());
+            skipped = true;
         }
-
-        // Validate with policies
-        policies.check_all(info, state)?;
-
         if self.junk_paths && matches!(info.kind, EntryKind::Directory) {
-            state.entries_skipped += 1;
-            return Ok(());
+            skipped = true;
         }
 
         let safe_path = self.resolve_path(&info.name);
+        let exists = self.dir.symlink_metadata(&safe_path).is_ok();
+
+        if !skipped
+            && matches!(info.kind, EntryKind::File)
+            && matches!(self.overwrite, OverwriteMode::Skip)
+            && exists {
+                skipped = true;
+            }
+
+        let action = if skipped {
+            EntryAction::Skipped
+        } else if exists
+            && matches!(info.kind, EntryKind::File)
+            && matches!(self.overwrite, OverwriteMode::Overwrite)
+        {
+            EntryAction::Overwritten
+        } else {
+            EntryAction::Created
+        };
+
+        if let Some(ref cb) = self.on_progress {
+            cb(&Progress {
+                entry_name: info.name.clone(),
+                entry_size: info.size,
+                entry_index,
+                total_entries,
+                bytes_written: state.bytes_written,
+                files_extracted: state.files_extracted,
+                action,
+            });
+        }
+
+        if skipped {
+            state.entries_skipped += 1;
+            return Ok(());
+        }
+
+        policies.check_all(info, state)?;
         self.prepare_entry_paths(info, &safe_path, state)?;
 
         if matches!(info.kind, EntryKind::File) {

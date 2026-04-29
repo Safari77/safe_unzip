@@ -48,7 +48,8 @@ pub mod r#async {
 
 pub use error::Error;
 pub use extractor::{
-    ExtractionMode, Extractor, OverwritePolicy, Progress, Report, SymlinkPolicy, VerifyReport,
+    EntryAction, ExtractionMode, Extractor, OverwritePolicy, Progress, Report, SymlinkPolicy,
+    VerifyReport,
 };
 pub use limits::Limits;
 

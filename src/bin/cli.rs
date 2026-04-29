@@ -26,13 +26,14 @@
 
 use clap::{CommandFactory, Parser, ValueEnum};
 use clap_complete::{Shell, generate};
-use safe_unzip::{
-    Driver, Error, ExtractionMode, Extractor, Limits, OverwritePolicy, SymlinkPolicy,
-};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use unicode_segmentation::UnicodeSegmentation;
+
+use safe_unzip::{
+    Driver, EntryAction, Error, ExtractionMode, Extractor, Limits, OverwritePolicy, SymlinkPolicy,
+};
 
 const MAX_CHARS_PER_GRAPHEME: usize = 15;
 
@@ -512,10 +513,16 @@ fn extract_zip(cli: &Cli, archive: &Path, config: &Config) -> Result<(), Error> 
     // Add progress callback if verbose
     if cli.verbose {
         extractor = extractor.on_progress(|p| {
+            let prefix = match p.action {
+                EntryAction::Skipped => "[skipped]   ",
+                EntryAction::Overwritten => "[overwrite] ",
+                EntryAction::Created => "[created]   ",
+            };
             println!(
-                "[{}/{}] {}",
+                "[{}/{}] {}{}",
                 p.entry_index + 1,
                 p.total_entries,
+                prefix,
                 sanitize_for_terminal(&p.entry_name)
             );
         });
@@ -618,16 +625,27 @@ fn extract_tar(
 
     if cli.verbose {
         driver = driver.on_progress(|p| {
+            let prefix = match p.action {
+                EntryAction::Skipped => "[skipped]   ",
+                EntryAction::Overwritten => "[overwrite] ",
+                EntryAction::Created => "[created]   ",
+            };
             if p.total_entries > 0 {
                 println!(
-                    "[{}/{}] {}",
+                    "[{}/{}] {}{}",
                     p.entry_index + 1,
                     p.total_entries,
+                    prefix,
                     sanitize_for_terminal(&p.entry_name)
                 );
             } else {
                 // For streaming TAR, we don't know the total
-                println!("[{}] {}", p.entry_index + 1, sanitize_for_terminal(&p.entry_name));
+                println!(
+                    "[{}] {}{}",
+                    p.entry_index + 1,
+                    prefix,
+                    sanitize_for_terminal(&p.entry_name)
+                );
             }
         });
     }
@@ -747,10 +765,16 @@ fn extract_sevenz(cli: &Cli, archive: &Path, config: &Config) -> Result<(), Erro
         let total_entries = adapter.len();
 
         driver = driver.on_progress(move |p| {
+            let prefix = match p.action {
+                EntryAction::Skipped => "[skipped]   ",
+                EntryAction::Overwritten => "[overwrite] ",
+                EntryAction::Created => "[created]   ",
+            };
             println!(
-                "[{}/{}] {}",
+                "[{}/{}] {}{}",
                 p.entry_index + 1,
                 total_entries,
+                prefix,
                 sanitize_for_terminal(&p.entry_name)
             );
         });
@@ -1009,8 +1033,8 @@ fn resolve_password(
     }
 
     // 1. Try passwords from config
-    if let Some(passwords_config) = &config.passwords {
-        if let Some(list) = &passwords_config.list {
+    if let Some(passwords_config) = &config.passwords
+        && let Some(list) = &passwords_config.list {
             if verbose {
                 println!("Checking passwords from config...");
             }
@@ -1020,7 +1044,6 @@ fn resolve_password(
                 }
             }
         }
-    }
 
     // 2. Prompt user securely
     eprint!("Archive is encrypted. Enter password: ");
