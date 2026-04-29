@@ -491,8 +491,16 @@ impl Extractor {
             }
 
             // 5. CHECK: Limits (Count & Lookahead Total)
+            // Check directory count
+            if entry.is_dir() && report.dirs_created >= self.limits.max_dir_count {
+                return Err(Error::DirCountExceeded {
+                    limit: self.limits.max_dir_count,
+                    attempted: report.dirs_created + 1,
+                });
+            }
+
             // Check file count
-            if report.files_extracted >= self.limits.max_file_count {
+            if !entry.is_dir() && report.files_extracted >= self.limits.max_file_count {
                 return Err(Error::FileCountExceeded {
                     limit: self.limits.max_file_count,
                     attempted: report.files_extracted + 1,
@@ -520,6 +528,12 @@ impl Extractor {
             // 7. EXECUTION
             if entry.is_dir() {
                 if created_dirs.insert(safe_relative_path.clone()) {
+                    if report.dirs_created >= self.limits.max_dir_count {
+                        return Err(Error::DirCountExceeded {
+                            limit: self.limits.max_dir_count,
+                            attempted: report.dirs_created + 1,
+                        });
+                    }
                     crate::entry::ensure_directory(
                         &self.dir,
                         &safe_relative_path,
@@ -534,7 +548,14 @@ impl Extractor {
                 {
                     let parent_str = parent.as_str();
                     if created_dirs.insert(parent_str.to_string()) {
+                        if report.dirs_created >= self.limits.max_dir_count {
+                            return Err(Error::DirCountExceeded {
+                                limit: self.limits.max_dir_count,
+                                attempted: report.dirs_created + 1,
+                            });
+                        }
                         crate::entry::ensure_directory(&self.dir, parent_str, self.dir_mode)?;
+                        report.dirs_created += 1;
                     }
                 }
 
@@ -577,6 +598,12 @@ impl Extractor {
                     OverwritePolicy::RenameBase | OverwritePolicy::RenameExt => {
                         let mut i = 1;
                         loop {
+                            if i > self.limits.max_renames {
+                                return Err(Error::Io(std::io::Error::new(
+                                    std::io::ErrorKind::AlreadyExists,
+                                    "Too many rename attempts for file",
+                                )));
+                            }
                             match self.dir.open_with(
                                 &actual_path,
                                 OpenOptions::new().write(true).create_new(true),
@@ -745,6 +772,7 @@ impl Extractor {
     fn validate_all<R: Read + Seek>(&self, archive: &mut zip::ZipArchive<R>) -> Result<(), Error> {
         let mut total_size: u64 = 0;
         let mut file_count: usize = 0;
+        let mut dir_count: usize = 0;
 
         for i in 0..archive.len() {
             // by_index_raw reads metadata WITHOUT decompressing
@@ -796,26 +824,37 @@ impl Extractor {
                 });
             }
 
-            // Accumulate totals (skip symlinks and dirs)
-            if !entry.is_dir() && !entry.is_symlink() {
+            // 5. Accumulate totals and check global limits
+            if entry.is_dir() {
+                // If junk_paths is enabled, directories are ignored during extraction,
+                // so they shouldn't count toward the limit.
+                if !self.junk_paths {
+                    dir_count += 1;
+                    if dir_count > self.limits.max_dir_count {
+                        return Err(Error::DirCountExceeded {
+                            limit: self.limits.max_dir_count,
+                            attempted: dir_count,
+                        });
+                    }
+                }
+            } else if !entry.is_symlink() {
                 total_size += entry.size();
                 file_count += 1;
+
+                if total_size > self.limits.max_total_bytes {
+                    return Err(Error::TotalSizeExceeded {
+                        limit: self.limits.max_total_bytes,
+                        would_be: total_size,
+                    });
+                }
+
+                if file_count > self.limits.max_file_count {
+                    return Err(Error::FileCountExceeded {
+                        limit: self.limits.max_file_count,
+                        attempted: file_count,
+                    });
+                }
             }
-        }
-
-        // 5. Check accumulated totals
-        if total_size > self.limits.max_total_bytes {
-            return Err(Error::TotalSizeExceeded {
-                limit: self.limits.max_total_bytes,
-                would_be: total_size,
-            });
-        }
-
-        if file_count > self.limits.max_file_count {
-            return Err(Error::FileCountExceeded {
-                limit: self.limits.max_file_count,
-                attempted: file_count,
-            });
         }
 
         Ok(())

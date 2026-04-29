@@ -20,6 +20,9 @@ pub enum Error {
     /// Exceeded maximum file count.
     FileCountExceeded { limit: usize, attempted: usize },
 
+    /// Exceeded maximum directory count.
+    DirCountExceeded { limit: usize, attempted: usize },
+
     /// Single file exceeds size limit.
     FileTooLarge { entry: String, limit: u64, size: u64 },
 
@@ -97,6 +100,13 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "extraction stopped at entry {}: would exceed {} file limit",
+                    attempted, limit
+                )
+            }
+            Self::DirCountExceeded { limit, attempted } => {
+                write!(
+                    f,
+                    "extraction stopped at directory {}: would exceed {} directory limit",
                     attempted, limit
                 )
             }

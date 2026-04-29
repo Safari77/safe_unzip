@@ -6,6 +6,9 @@ pub struct Limits {
     /// Maximum number of files to extract. Default: 10,000.
     pub max_file_count: usize,
 
+    /// Maximum number of directories to extract/create. Default: 100,000.
+    pub max_dir_count: usize,
+
     /// Maximum size of a single file. Default: 100 MB.
     pub max_single_file: u64,
 
@@ -14,6 +17,9 @@ pub struct Limits {
 
     /// Maximum path length
     pub max_path_len: usize,
+
+    /// Maximum number of rename attempts on collision. Default: 1,000.
+    pub max_renames: usize,
 }
 
 impl Default for Limits {
@@ -21,8 +27,10 @@ impl Default for Limits {
         Self {
             max_total_bytes: 4096 * 1024 * 1024, // 4 GiB
             max_file_count: 100_000,
+            max_dir_count: 100_000,
             max_single_file: 4096 * 1024 * 1024, // 4 GiB
             max_path_depth: 50,
+            max_renames: 1000,
 
             // Linux and other Unix systems
             #[cfg(all(unix, not(target_os = "macos")))]

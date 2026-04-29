@@ -120,6 +120,12 @@ impl Driver {
         let mut i = 1;
         let mut current_path = path.to_string();
         loop {
+            if i > self.limits.max_renames {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "Too many rename attempts for file",
+                )));
+            }
             match self.dir.open_with(&current_path, OpenOptions::new().write(true).create_new(true))
             {
                 Ok(f) => return Ok((f, current_path)),
@@ -183,7 +189,7 @@ impl Driver {
         })
     }
 
-    /// Ensures directories are created for the entry (and caches them).
+    // Update prepare_entry_paths to check dir limits dynamically
     fn prepare_entry_paths(
         &self,
         info: &EntryInfo,
@@ -193,6 +199,12 @@ impl Driver {
         match info.kind {
             EntryKind::Directory => {
                 if state.created_dirs_cache.insert(safe_path.to_string()) {
+                    if state.dirs_created >= self.limits.max_dir_count {
+                        return Err(Error::DirCountExceeded {
+                            limit: self.limits.max_dir_count,
+                            attempted: state.dirs_created + 1,
+                        });
+                    }
                     crate::entry::ensure_directory(
                         &self.dir,
                         safe_path,
@@ -208,7 +220,14 @@ impl Driver {
                 {
                     let parent_str = parent.as_str();
                     if state.created_dirs_cache.insert(parent_str.to_string()) {
+                        if state.dirs_created >= self.limits.max_dir_count {
+                            return Err(Error::DirCountExceeded {
+                                limit: self.limits.max_dir_count,
+                                attempted: state.dirs_created + 1,
+                            });
+                        }
                         crate::entry::ensure_directory(&self.dir, parent_str, self.dir_mode)?;
+                        state.dirs_created += 1; // Increment here!
                     }
                 }
             }
@@ -392,7 +411,7 @@ impl Driver {
                 self.limits.max_path_len,
             )?)
             .with(SizePolicy::new(self.limits.max_single_file, self.limits.max_total_bytes))
-            .with(CountPolicy::new(self.limits.max_file_count))
+            .with(CountPolicy::new(self.limits.max_file_count, self.limits.max_dir_count))
             .with(DepthPolicy::new(self.limits.max_path_depth))
             .with(SymlinkPolicy::new(self.symlinks)))
     }

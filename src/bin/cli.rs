@@ -72,14 +72,22 @@ pub fn sanitize_for_terminal(input: &str) -> String {
     out
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Default)]
 struct Config {
     passwords: Option<PasswordsConfig>,
+    limits: Option<LimitsConfig>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Default)]
 struct PasswordsConfig {
     list: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct LimitsConfig {
+    files: Option<usize>,
+    dirs: Option<usize>,
+    renames: Option<usize>,
 }
 
 #[derive(Parser)]
@@ -126,6 +134,14 @@ struct Cli {
     #[arg(long)]
     max_files: Option<usize>,
 
+    /// Maximum number of directories to extract/create
+    #[arg(long)]
+    max_dirs: Option<usize>,
+
+    /// Maximum number of rename attempts on collision
+    #[arg(long)]
+    max_renames: Option<usize>,
+
     /// Maximum size of a single file (e.g., 50M)
     #[arg(long, value_parser = parse_size)]
     max_single_file: Option<u64>,
@@ -134,7 +150,7 @@ struct Cli {
     #[arg(long)]
     max_depth: Option<usize>,
 
-    /// Maximumm path length
+    /// Maximum path length
     #[arg(long)]
     max_path_len: Option<usize>,
 
@@ -260,6 +276,30 @@ enum ArchiveFormat {
     SevenZ,
 }
 
+fn load_config(verbose: bool) -> Config {
+    if let Some(config_dir) = dirs_next::config_dir() {
+        let config_path = config_dir.join("safe_unzip.toml");
+        if config_path.exists() {
+            if verbose {
+                println!("Reading config from: {}", config_path.display());
+            }
+            if let Ok(content) = std::fs::read_to_string(&config_path) {
+                match toml::from_str::<Config>(&content) {
+                    Ok(config) => return config,
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: Failed to parse config {}: {}",
+                            config_path.display(),
+                            e
+                        )
+                    }
+                }
+            }
+        }
+    }
+    Config::default()
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -278,6 +318,7 @@ fn main() -> ExitCode {
 }
 
 fn run(mut cli: Cli) -> Result<(), Error> {
+    let config = load_config(cli.verbose);
     let archives = std::mem::take(&mut cli.archives);
     let mut processed_count = 0;
     let mut error_count = 0;
@@ -290,7 +331,7 @@ fn run(mut cli: Cli) -> Result<(), Error> {
             println!("Processing {} ({} bytes).", safe_archive_name, size);
         }
 
-        match process_archive(&mut cli, archive) {
+        match process_archive(&mut cli, archive, &config) {
             Ok(_) => processed_count += 1,
             Err(e) => {
                 error_count += 1;
@@ -318,11 +359,11 @@ fn run(mut cli: Cli) -> Result<(), Error> {
     }
 }
 
-fn process_archive(cli: &mut Cli, archive: &Path) -> Result<(), Error> {
+fn process_archive(cli: &mut Cli, archive: &Path, config: &Config) -> Result<(), Error> {
     let format = detect_format(archive);
 
     if cli.password.is_none() {
-        cli.password = resolve_password(archive, &format, cli.verbose);
+        cli.password = resolve_password(archive, &format, cli.verbose, config);
     }
 
     // List mode
@@ -336,12 +377,12 @@ fn process_archive(cli: &mut Cli, archive: &Path) -> Result<(), Error> {
     }
 
     match format {
-        ArchiveFormat::Zip => extract_zip(cli, archive),
-        ArchiveFormat::Tar | ArchiveFormat::TarGz => extract_tar(cli, archive, format),
+        ArchiveFormat::Zip => extract_zip(cli, archive, config),
+        ArchiveFormat::Tar | ArchiveFormat::TarGz => extract_tar(cli, archive, format, config),
         ArchiveFormat::SevenZ => {
             #[cfg(feature = "sevenz")]
             {
-                extract_sevenz(cli, archive)
+                extract_sevenz(cli, archive, config)
             }
             #[cfg(not(feature = "sevenz"))]
             {
@@ -355,13 +396,25 @@ fn process_archive(cli: &mut Cli, archive: &Path) -> Result<(), Error> {
     }
 }
 
-fn extract_zip(cli: &Cli, archive: &Path) -> Result<(), Error> {
+fn extract_zip(cli: &Cli, archive: &Path, config: &Config) -> Result<(), Error> {
+    let def = Limits::default();
     let limits = Limits {
-        max_total_bytes: cli.max_size.unwrap_or(Limits::default().max_total_bytes),
-        max_file_count: cli.max_files.unwrap_or(Limits::default().max_file_count),
-        max_single_file: cli.max_single_file.unwrap_or(Limits::default().max_single_file),
-        max_path_depth: cli.max_depth.unwrap_or(Limits::default().max_path_depth),
-        max_path_len: cli.max_path_len.unwrap_or(Limits::default().max_path_len),
+        max_total_bytes: cli.max_size.unwrap_or(def.max_total_bytes),
+        max_file_count: cli
+            .max_files
+            .or_else(|| config.limits.as_ref().and_then(|l| l.files))
+            .unwrap_or(def.max_file_count),
+        max_dir_count: cli
+            .max_dirs
+            .or_else(|| config.limits.as_ref().and_then(|l| l.dirs))
+            .unwrap_or(def.max_dir_count),
+        max_renames: cli
+            .max_renames
+            .or_else(|| config.limits.as_ref().and_then(|l| l.renames))
+            .unwrap_or(def.max_renames),
+        max_single_file: cli.max_single_file.unwrap_or(def.max_single_file),
+        max_path_depth: cli.max_depth.unwrap_or(def.max_path_depth),
+        max_path_len: cli.max_path_len.unwrap_or(def.max_path_len),
     };
 
     let overwrite = match cli.overwrite {
@@ -444,13 +497,30 @@ fn extract_zip(cli: &Cli, archive: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-fn extract_tar(cli: &Cli, archive: &Path, format: ArchiveFormat) -> Result<(), Error> {
+fn extract_tar(
+    cli: &Cli,
+    archive: &Path,
+    format: ArchiveFormat,
+    config: &Config,
+) -> Result<(), Error> {
+    let def = Limits::default();
     let limits = Limits {
-        max_total_bytes: cli.max_size.unwrap_or(Limits::default().max_total_bytes),
-        max_file_count: cli.max_files.unwrap_or(Limits::default().max_file_count),
-        max_single_file: cli.max_single_file.unwrap_or(Limits::default().max_single_file),
-        max_path_depth: cli.max_depth.unwrap_or(Limits::default().max_path_depth),
-        max_path_len: cli.max_path_len.unwrap_or(Limits::default().max_path_len),
+        max_total_bytes: cli.max_size.unwrap_or(def.max_total_bytes),
+        max_file_count: cli
+            .max_files
+            .or_else(|| config.limits.as_ref().and_then(|l| l.files))
+            .unwrap_or(def.max_file_count),
+        max_dir_count: cli
+            .max_dirs
+            .or_else(|| config.limits.as_ref().and_then(|l| l.dirs))
+            .unwrap_or(def.max_dir_count),
+        max_renames: cli
+            .max_renames
+            .or_else(|| config.limits.as_ref().and_then(|l| l.renames))
+            .unwrap_or(def.max_renames),
+        max_single_file: cli.max_single_file.unwrap_or(def.max_single_file),
+        max_path_depth: cli.max_depth.unwrap_or(def.max_path_depth),
+        max_path_len: cli.max_path_len.unwrap_or(def.max_path_len),
     };
 
     let overwrite_mode = match cli.overwrite {
@@ -556,13 +626,25 @@ fn extract_tar(cli: &Cli, archive: &Path, format: ArchiveFormat) -> Result<(), E
 }
 
 #[cfg(feature = "sevenz")]
-fn extract_sevenz(cli: &Cli, archive: &Path) -> Result<(), Error> {
+fn extract_sevenz(cli: &Cli, archive: &Path, config: &Config) -> Result<(), Error> {
+    let def = Limits::default();
     let limits = Limits {
-        max_total_bytes: cli.max_size.unwrap_or(Limits::default().max_total_bytes),
-        max_file_count: cli.max_files.unwrap_or(Limits::default().max_file_count),
-        max_single_file: cli.max_single_file.unwrap_or(Limits::default().max_single_file),
-        max_path_depth: cli.max_depth.unwrap_or(Limits::default().max_path_depth),
-        max_path_len: cli.max_path_len.unwrap_or(Limits::default().max_path_len),
+        max_total_bytes: cli.max_size.unwrap_or(def.max_total_bytes),
+        max_file_count: cli
+            .max_files
+            .or_else(|| config.limits.as_ref().and_then(|l| l.files))
+            .unwrap_or(def.max_file_count),
+        max_dir_count: cli
+            .max_dirs
+            .or_else(|| config.limits.as_ref().and_then(|l| l.dirs))
+            .unwrap_or(def.max_dir_count),
+        max_renames: cli
+            .max_renames
+            .or_else(|| config.limits.as_ref().and_then(|l| l.renames))
+            .unwrap_or(def.max_renames),
+        max_single_file: cli.max_single_file.unwrap_or(def.max_single_file),
+        max_path_depth: cli.max_depth.unwrap_or(def.max_path_depth),
+        max_path_len: cli.max_path_len.unwrap_or(def.max_path_len),
     };
 
     // Map policies to Driver types
@@ -855,32 +937,40 @@ fn format_error(e: &Error) -> String {
         Error::FileCountExceeded { limit, .. } => {
             format!("Too many files (limit: {})", limit)
         }
+        Error::DirCountExceeded { limit, .. } => {
+            format!("Too many directories (limit: {})", limit)
+        }
         Error::AlreadyExists { entry } => {
             format!("File already exists: {}", sanitize_for_terminal(entry))
         }
         Error::EncryptedEntry { entry } => {
             format!("Encrypted entry not supported: {}", sanitize_for_terminal(entry))
         }
-        // Fail-safe: Sanitize the raw error string completely to catch any unhandled custom errors
-        // that might contain malicious paths injected via Display implementations.
         _ => sanitize_for_terminal(&e.to_string()),
     }
 }
 
-fn resolve_password(archive: &Path, format: &ArchiveFormat, verbose: bool) -> Option<String> {
-    // Only attempt to resolve password if the archive actually needs one
+// Only attempt to resolve password if the archive actually needs one
+fn resolve_password(
+    archive: &Path,
+    format: &ArchiveFormat,
+    verbose: bool,
+    config: &Config,
+) -> Option<String> {
     if !requires_password(archive, format) {
         return None;
     }
 
-    // 1. Try passwords from config file
-    if let Some(config_passwords) = load_config_passwords(verbose) {
-        if verbose {
-            println!("Checking passwords from config...");
-        }
-        for pwd in config_passwords {
-            if verify_password(archive, format, &pwd) {
-                return Some(pwd);
+    // 1. Try passwords from config
+    if let Some(passwords_config) = &config.passwords {
+        if let Some(list) = &passwords_config.list {
+            if verbose {
+                println!("Checking passwords from config...");
+            }
+            for pwd in list {
+                if verify_password(archive, format, pwd) {
+                    return Some(pwd.clone());
+                }
             }
         }
     }
@@ -921,10 +1011,7 @@ fn requires_password(path: &Path, format: &ArchiveFormat) -> bool {
             }
             false
         }
-        // Standard TAR files do not support native encryption
         ArchiveFormat::Tar | ArchiveFormat::TarGz => false,
-
-        // For SevenZ, you can leave it as true (or ideally implement a check reading the 7z headers)
         ArchiveFormat::SevenZ => true,
     }
 }
@@ -961,7 +1048,6 @@ fn verify_password(path: &Path, format: &ArchiveFormat, password: &str) -> bool 
                 false
             }
         }
-        // Cannot verify easily for other formats without partial extraction
         _ => false,
     }
 }
@@ -1005,40 +1091,4 @@ fn verify_7z_password(path: &Path, password: &str) -> bool {
         }
         Err(_) => false, // Open failed (e.g. encrypted headers with wrong password)
     }
-}
-
-fn load_config_passwords(verbose: bool) -> Option<Vec<String>> {
-    let config_dir = dirs_next::config_dir()?;
-    let config_path = config_dir.join("safe_unzip.toml");
-
-    if config_path.exists() {
-        if verbose {
-            println!("Reading config from: {}", config_path.display());
-        }
-        match std::fs::read_to_string(&config_path) {
-            Ok(content) => match toml::from_str::<Config>(&content) {
-                Ok(config) => {
-                    if let Some(passwords_config) = config.passwords {
-                        if let Some(ref list) = passwords_config.list
-                            && verbose
-                        {
-                            println!("Loaded {} passwords from config", list.len());
-                        }
-                        return passwords_config.list;
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: Failed to parse config file {}: {}",
-                        config_path.display(),
-                        e
-                    );
-                }
-            },
-            Err(e) => {
-                eprintln!("Warning: Failed to read config file {}: {}", config_path.display(), e);
-            }
-        }
-    }
-    None
 }

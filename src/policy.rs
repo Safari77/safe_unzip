@@ -225,22 +225,33 @@ impl Policy for SizePolicy {
 pub struct CountPolicy {
     /// Maximum number of files.
     pub max_files: usize,
+    /// Maximum number of directories.
+    pub max_dirs: usize,
 }
 
 impl CountPolicy {
     /// Create a new count policy.
-    pub fn new(max_files: usize) -> Self {
-        Self { max_files }
+    pub fn new(max_files: usize, max_dirs: usize) -> Self {
+        Self { max_files, max_dirs }
     }
 }
 
 impl Policy for CountPolicy {
-    fn check(&self, _entry: &EntryInfo, state: &ExtractionState) -> Result<(), Error> {
-        if state.files_extracted >= self.max_files {
-            return Err(Error::FileCountExceeded {
-                limit: self.max_files,
-                attempted: state.files_extracted + 1,
-            });
+    fn check(&self, entry: &EntryInfo, state: &ExtractionState) -> Result<(), Error> {
+        if matches!(entry.kind, EntryKind::Directory) {
+            if state.dirs_created >= self.max_dirs {
+                return Err(Error::DirCountExceeded {
+                    limit: self.max_dirs,
+                    attempted: state.dirs_created + 1,
+                });
+            }
+        } else {
+            if state.files_extracted >= self.max_files {
+                return Err(Error::FileCountExceeded {
+                    limit: self.max_files,
+                    attempted: state.files_extracted + 1,
+                });
+            }
         }
         Ok(())
     }
@@ -335,6 +346,7 @@ pub struct PolicyConfig {
     pub max_single_file: u64,
     pub max_total: u64,
     pub max_files: usize,
+    pub max_dirs: usize,
     pub max_depth: usize,
     pub symlink_behavior: SymlinkBehavior,
     pub allow_windows_reserved: bool,
@@ -352,7 +364,7 @@ impl PolicyConfig {
                 self.max_path_len,
             )?)
             .with(SizePolicy::new(self.max_single_file, self.max_total))
-            .with(CountPolicy::new(self.max_files))
+            .with(CountPolicy::new(self.max_files, self.max_dirs))
             .with(DepthPolicy::new(self.max_depth))
             .with(SymlinkPolicy::new(self.symlink_behavior)))
     }
