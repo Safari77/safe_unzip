@@ -32,6 +32,45 @@ use safe_unzip::{
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use unicode_segmentation::UnicodeSegmentation;
+
+const MAX_CHARS_PER_GRAPHEME: usize = 15;
+
+/// Escape C0, DEL, and C1 control characters so a string from an untrusted
+/// filename or path can be safely written to the terminal.
+pub fn sanitize_for_terminal(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 8);
+
+    for grapheme in input.graphemes(true) {
+        let bounded_chars = grapheme.chars().take(MAX_CHARS_PER_GRAPHEME);
+
+        for c in bounded_chars {
+            match c {
+                '\t' => out.push('\t'),
+                '\x00'..='\x1F' => {
+                    out.push('^');
+                    out.push(char::from_u32(0x40 + c as u32).unwrap_or('?'));
+                }
+                '\x7F' => out.push_str("^?"),
+                '\u{80}'..='\u{9F}' => {
+                    use std::fmt::Write as _;
+                    let _ = write!(out, "\\u{{{:x}}}", c as u32);
+                }
+                '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{FEFF}'
+                | '\u{E000}'..='\u{F8FF}' => {
+                    use std::fmt::Write as _;
+                    let _ = write!(out, "\\u{{{:x}}}", c as u32);
+                }
+                other => out.push(other),
+            }
+        }
+    }
+
+    out
+}
 
 #[derive(serde::Deserialize)]
 struct Config {
@@ -247,7 +286,8 @@ fn run(mut cli: Cli) -> Result<(), Error> {
         let size = std::fs::metadata(archive).map(|m| m.len()).unwrap_or(0);
 
         if !cli.quiet {
-            println!("Processing {} ({} bytes).", archive.display(), size);
+            let safe_archive_name = sanitize_for_terminal(&archive.to_string_lossy());
+            println!("Processing {} ({} bytes).", safe_archive_name, size);
         }
 
         match process_archive(&mut cli, archive) {
@@ -372,7 +412,12 @@ fn extract_zip(cli: &Cli, archive: &Path) -> Result<(), Error> {
     // Add progress callback if verbose
     if cli.verbose {
         extractor = extractor.on_progress(|p| {
-            println!("[{}/{}] {}", p.entry_index + 1, p.total_entries, p.entry_name);
+            println!(
+                "[{}/{}] {}",
+                p.entry_index + 1,
+                p.total_entries,
+                sanitize_for_terminal(&p.entry_name)
+            );
         });
     }
 
@@ -388,7 +433,7 @@ fn extract_zip(cli: &Cli, archive: &Path) -> Result<(), Error> {
         if !report.renames.is_empty() {
             println!("\nThe following files were renamed to avoid overwriting:");
             for (orig, new) in report.renames {
-                println!("  {} -> {}", orig, new);
+                println!("  {} -> {}", sanitize_for_terminal(&orig), sanitize_for_terminal(&new));
             }
         }
         if report.entries_skipped > 0 {
@@ -457,10 +502,15 @@ fn extract_tar(cli: &Cli, archive: &Path, format: ArchiveFormat) -> Result<(), E
     if cli.verbose {
         driver = driver.on_progress(|p| {
             if p.total_entries > 0 {
-                println!("[{}/{}] {}", p.entry_index + 1, p.total_entries, p.entry_name);
+                println!(
+                    "[{}/{}] {}",
+                    p.entry_index + 1,
+                    p.total_entries,
+                    sanitize_for_terminal(&p.entry_name)
+                );
             } else {
                 // For streaming TAR, we don't know the total
-                println!("[{}] {}", p.entry_index + 1, p.entry_name);
+                println!("[{}] {}", p.entry_index + 1, sanitize_for_terminal(&p.entry_name));
             }
         });
     }
@@ -494,7 +544,7 @@ fn extract_tar(cli: &Cli, archive: &Path, format: ArchiveFormat) -> Result<(), E
         if !report.renames.is_empty() {
             println!("\nThe following files were renamed to avoid overwriting:");
             for (orig, new) in report.renames {
-                println!("  {} -> {}", orig, new);
+                println!("  {} -> {}", sanitize_for_terminal(&orig), sanitize_for_terminal(&new));
             }
         }
         if report.entries_skipped > 0 {
@@ -568,7 +618,12 @@ fn extract_sevenz(cli: &Cli, archive: &Path) -> Result<(), Error> {
         let total_entries = adapter.len();
 
         driver = driver.on_progress(move |p| {
-            println!("[{}/{}] {}", p.entry_index + 1, total_entries, p.entry_name);
+            println!(
+                "[{}/{}] {}",
+                p.entry_index + 1,
+                total_entries,
+                sanitize_for_terminal(&p.entry_name)
+            );
         });
     }
 
@@ -584,7 +639,7 @@ fn extract_sevenz(cli: &Cli, archive: &Path) -> Result<(), Error> {
         if !report.renames.is_empty() {
             println!("\nThe following files were renamed to avoid overwriting:");
             for (orig, new) in report.renames {
-                println!("  {} -> {}", orig, new);
+                println!("  {} -> {}", sanitize_for_terminal(&orig), sanitize_for_terminal(&new));
             }
         }
         if report.entries_skipped > 0 {
@@ -596,12 +651,14 @@ fn extract_sevenz(cli: &Cli, archive: &Path) -> Result<(), Error> {
 }
 
 fn list_archive(path: &Path, format: ArchiveFormat, quiet: bool) -> Result<(), Error> {
+    let safe_archive_path = sanitize_for_terminal(&path.to_string_lossy());
+
     match format {
         ArchiveFormat::Zip => {
             let entries = safe_unzip::list_zip_entries(path)?;
 
             if !quiet {
-                println!("{} entries in {}:", entries.len(), path.display());
+                println!("{} entries in {}:", entries.len(), safe_archive_path);
                 println!();
             }
 
@@ -612,7 +669,12 @@ fn list_archive(path: &Path, format: ArchiveFormat, quiet: bool) -> Result<(), E
                     safe_unzip::EntryKind::Directory => "/",
                     safe_unzip::EntryKind::Symlink { .. } => " -> [symlink]",
                 };
-                println!("{:>10}  {}{}", format_bytes(entry.size), entry.name, kind);
+                println!(
+                    "{:>10}  {}{}",
+                    format_bytes(entry.size),
+                    sanitize_for_terminal(&entry.name),
+                    kind
+                );
                 total_size += entry.size;
             }
 
@@ -629,7 +691,7 @@ fn list_archive(path: &Path, format: ArchiveFormat, quiet: bool) -> Result<(), E
             };
 
             if !quiet {
-                println!("{} entries in {}:", entries.len(), path.display());
+                println!("{} entries in {}:", entries.len(), safe_archive_path);
                 println!();
             }
 
@@ -640,7 +702,12 @@ fn list_archive(path: &Path, format: ArchiveFormat, quiet: bool) -> Result<(), E
                     safe_unzip::EntryKind::Directory => "/",
                     safe_unzip::EntryKind::Symlink { .. } => " -> [symlink]",
                 };
-                println!("{:>10}  {}{}", format_bytes(entry.size), entry.name, kind);
+                println!(
+                    "{:>10}  {}{}",
+                    format_bytes(entry.size),
+                    sanitize_for_terminal(&entry.name),
+                    kind
+                );
                 total_size += entry.size;
             }
 
@@ -656,7 +723,7 @@ fn list_archive(path: &Path, format: ArchiveFormat, quiet: bool) -> Result<(), E
                 let entries = adapter.entries_metadata();
 
                 if !quiet {
-                    println!("{} entries in {}:", entries.len(), path.display());
+                    println!("{} entries in {}:", entries.len(), safe_archive_path);
                     println!();
                 }
 
@@ -667,7 +734,12 @@ fn list_archive(path: &Path, format: ArchiveFormat, quiet: bool) -> Result<(), E
                         safe_unzip::EntryKind::Directory => "/",
                         safe_unzip::EntryKind::Symlink { .. } => " -> [symlink]",
                     };
-                    println!("{:>10}  {}{}", format_bytes(entry.size), entry.name, kind);
+                    println!(
+                        "{:>10}  {}{}",
+                        format_bytes(entry.size),
+                        sanitize_for_terminal(&entry.name),
+                        kind
+                    );
                     total_size += entry.size;
                 }
                 if !quiet {
@@ -690,8 +762,10 @@ fn list_archive(path: &Path, format: ArchiveFormat, quiet: bool) -> Result<(), E
 }
 
 fn verify_archive(path: &Path, format: ArchiveFormat, quiet: bool) -> Result<(), Error> {
+    let safe_archive_path = sanitize_for_terminal(&path.to_string_lossy());
+
     if !quiet {
-        println!("Verifying {}...", path.display());
+        println!("Verifying {}...", safe_archive_path);
     }
 
     match format {
@@ -761,7 +835,7 @@ fn format_bytes(bytes: u64) -> String {
 fn format_error(e: &Error) -> String {
     match e {
         Error::PathEscape { entry, detail } => {
-            format!("Path traversal blocked in '{}': {}", entry, detail)
+            format!("Path traversal blocked in '{}': {}", sanitize_for_terminal(entry), detail)
         }
         Error::TotalSizeExceeded { limit, would_be } => {
             format!(
@@ -773,7 +847,7 @@ fn format_error(e: &Error) -> String {
         Error::FileTooLarge { entry, size, limit } => {
             format!(
                 "File '{}' too large: {} (limit: {})",
-                entry,
+                sanitize_for_terminal(entry),
                 format_bytes(*size),
                 format_bytes(*limit)
             )
@@ -782,12 +856,14 @@ fn format_error(e: &Error) -> String {
             format!("Too many files (limit: {})", limit)
         }
         Error::AlreadyExists { entry } => {
-            format!("File already exists: {}", entry)
+            format!("File already exists: {}", sanitize_for_terminal(entry))
         }
         Error::EncryptedEntry { entry } => {
-            format!("Encrypted entry not supported: {}", entry)
+            format!("Encrypted entry not supported: {}", sanitize_for_terminal(entry))
         }
-        _ => e.to_string(),
+        // Fail-safe: Sanitize the raw error string completely to catch any unhandled custom errors
+        // that might contain malicious paths injected via Display implementations.
+        _ => sanitize_for_terminal(&e.to_string()),
     }
 }
 
