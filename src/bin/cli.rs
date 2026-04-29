@@ -72,6 +72,39 @@ pub fn sanitize_for_terminal(input: &str) -> String {
     out
 }
 
+const VCS_EXCLUSIONS: &[&str] = &[
+    // CVS
+    "CVS",
+    ".cvsignore",
+    // RCS
+    "RCS",
+    // SCCS
+    "SCCS",
+    // SVN
+    ".svn",
+    // git
+    ".git",
+    ".gitignore",
+    ".gitattributes",
+    ".gitmodules",
+    // Arch
+    ".arch-ids",
+    "{arch}",
+    "=RELEASE-ID",
+    "=meta-update",
+    "=update",
+    // Bazaar
+    ".bzr",
+    ".bzrignore",
+    ".bzrtags",
+    // Mercurial
+    ".hg",
+    ".hgignore",
+    ".hgtags",
+    // darcs
+    "_darcs",
+];
+
 #[derive(serde::Deserialize, Default)]
 struct Config {
     passwords: Option<PasswordsConfig>,
@@ -181,6 +214,10 @@ struct Cli {
     /// Exclude files matching glob patterns (can be repeated)
     #[arg(long = "exclude", value_name = "PATTERN")]
     exclude_patterns: Vec<String>,
+
+    /// Exclude version control directories and files (like tar --exclude-vcs)
+    #[arg(long)]
+    exclude_vcs: bool,
 
     /// Extract only specific files by name (can be repeated)
     #[arg(long = "only", value_name = "FILE")]
@@ -319,6 +356,16 @@ fn main() -> ExitCode {
 
 fn run(mut cli: Cli) -> Result<(), Error> {
     let config = load_config(cli.verbose);
+    // Map --exclude-vcs directly to the existing glob engine
+    if cli.exclude_vcs {
+        for &vcs_name in VCS_EXCLUSIONS {
+            // Exclude the file/directory itself at any depth
+            cli.exclude_patterns.push(format!("**/{}", vcs_name));
+            // Exclude all contents inside it if it is a directory
+            cli.exclude_patterns.push(format!("**/{}/**", vcs_name));
+        }
+    }
+
     let archives = std::mem::take(&mut cli.archives);
     let mut processed_count = 0;
     let mut error_count = 0;
