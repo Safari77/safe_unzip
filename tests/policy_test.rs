@@ -144,7 +144,7 @@ fn test_size_policy_blocks_total_exceeded() {
 
 #[test]
 fn test_count_policy_allows_within_limit() {
-    let policy = CountPolicy::new(10);
+    let policy = CountPolicy::new(10, 10);
     let mut state = default_state();
     state.files_extracted = 5;
 
@@ -154,7 +154,7 @@ fn test_count_policy_allows_within_limit() {
 
 #[test]
 fn test_count_policy_blocks_at_limit() {
-    let policy = CountPolicy::new(10);
+    let policy = CountPolicy::new(10, 10);
     let mut state = default_state();
     state.files_extracted = 10;
 
@@ -165,7 +165,7 @@ fn test_count_policy_blocks_at_limit() {
 
 #[test]
 fn test_count_policy_zero_limit() {
-    let policy = CountPolicy::new(0);
+    let policy = CountPolicy::new(0, 0);
     let state = default_state();
 
     let entry = file_info("file.txt", 100);
@@ -268,7 +268,7 @@ fn test_policy_chain_multiple_policies() {
     let chain = PolicyChain::new()
         .with(PathPolicy::new(dest.path(), false, false, 1024).unwrap())
         .with(SizePolicy::new(100, 1000))
-        .with(CountPolicy::new(10));
+        .with(CountPolicy::new(10, 10));
     let state = default_state();
 
     // Valid entry passes all
@@ -298,6 +298,7 @@ fn test_policy_config_build() {
         max_single_file: 1000,
         max_total: 10000,
         max_files: 100,
+        max_dirs: 100,
         max_depth: 10,
         symlink_behavior: SymlinkBehavior::Skip,
         allow_windows_reserved: false,
@@ -325,6 +326,7 @@ fn test_policy_config_symlink_error() {
         max_single_file: 1000,
         max_total: 10000,
         max_files: 100,
+        max_dirs: 100,
         max_depth: 10,
         symlink_behavior: SymlinkBehavior::Error,
         allow_windows_reserved: false,

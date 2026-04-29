@@ -1,6 +1,6 @@
 use safe_unzip::{Driver, Error, ExtractionMode, Extractor, Limits, OverwritePolicy, ZipAdapter};
 use std::io::{Seek, Write};
-use tempfile::{tempdir, NamedTempFile};
+use tempfile::{NamedTempFile, tempdir};
 use zip::write::FileOptions;
 
 // ============================================================================
@@ -55,9 +55,7 @@ fn test_blocks_zip_slip() {
     let zip_file = create_malicious_zip().expect("failed to create fixture");
 
     // 2. Execution
-    let result = Extractor::new(root.path())
-        .expect("jail init failed")
-        .extract(zip_file);
+    let result = Extractor::new(root.path()).expect("jail init failed").extract(zip_file);
 
     // 3. Assertion
     match result {
@@ -96,10 +94,7 @@ fn test_limits_quota() {
     // Set limit to 100 bytes (should fail)
     let result = Extractor::new(root.path())
         .unwrap()
-        .limits(safe_unzip::Limits {
-            max_total_bytes: 100,
-            ..Default::default()
-        })
+        .limits(safe_unzip::Limits { max_total_bytes: 100, ..Default::default() })
         .extract(zip_file);
 
     match result {
@@ -127,10 +122,7 @@ fn test_extract_file_method() {
 
     // Extract using the new extract_file method
     let dest = tempdir().unwrap();
-    let report = Extractor::new(dest.path())
-        .unwrap()
-        .extract_file(zip_file.path())
-        .unwrap();
+    let report = Extractor::new(dest.path()).unwrap().extract_file(zip_file.path()).unwrap();
 
     assert_eq!(report.files_extracted, 1);
     assert_eq!(report.bytes_written, 13); // "Hello, World!" = 13 bytes
@@ -167,10 +159,8 @@ fn test_validate_first_no_partial_state() {
     let dest = tempdir().unwrap();
 
     // Use ValidateFirst mode
-    let result = Extractor::new(dest.path())
-        .unwrap()
-        .mode(ExtractionMode::ValidateFirst)
-        .extract(zip_file);
+    let result =
+        Extractor::new(dest.path()).unwrap().mode(ExtractionMode::ValidateFirst).extract(zip_file);
 
     // Should fail with PathEscape
     assert!(matches!(result, Err(Error::PathEscape { .. })));
@@ -307,11 +297,7 @@ fn test_filter_by_size() {
     ]);
 
     // Only extract files smaller than 10 bytes
-    let report = Extractor::new(dest.path())
-        .unwrap()
-        .filter(|e| e.size < 10)
-        .extract(zip)
-        .unwrap();
+    let report = Extractor::new(dest.path()).unwrap().filter(|e| e.size < 10).extract(zip).unwrap();
 
     assert_eq!(report.files_extracted, 1);
     assert!(dest.path().join("small.txt").exists());
@@ -332,10 +318,7 @@ fn test_single_file_size_limit() {
 
     let result = Extractor::new(dest.path())
         .unwrap()
-        .limits(Limits {
-            max_single_file: 100,
-            ..Default::default()
-        })
+        .limits(Limits { max_single_file: 100, ..Default::default() })
         .extract(zip);
 
     match result {
@@ -363,16 +346,10 @@ fn test_file_count_limit() {
 
     let result = Extractor::new(dest.path())
         .unwrap()
-        .limits(Limits {
-            max_file_count: 3,
-            ..Default::default()
-        })
+        .limits(Limits { max_file_count: 3, ..Default::default() })
         .extract(zip);
 
-    assert!(matches!(
-        result,
-        Err(Error::FileCountExceeded { limit: 3, .. })
-    ));
+    assert!(matches!(result, Err(Error::FileCountExceeded { limit: 3, .. })));
 
     println!("✅ File count limit works");
 }
@@ -391,20 +368,14 @@ fn test_path_depth_limit() {
 
     let result = Extractor::new(dest.path())
         .unwrap()
-        .limits(Limits {
-            max_path_depth: 3,
-            ..Default::default()
-        })
+        .limits(Limits { max_path_depth: 3, ..Default::default() })
         .extract(zip_file);
 
     match result {
         Err(Error::PathTooDeep { depth, limit, .. }) => {
             assert_eq!(limit, 3);
             assert!(depth > 3);
-            println!(
-                "✅ Path depth limit works (depth={}, limit={})",
-                depth, limit
-            );
+            println!("✅ Path depth limit works (depth={}, limit={})", depth, limit);
         }
         _ => panic!("Expected PathTooDeep error"),
     }
@@ -430,12 +401,9 @@ fn test_creates_directories() {
 
     let zip_file = zip.finish().unwrap();
 
-    let report = Extractor::new(dest.path())
-        .unwrap()
-        .extract(zip_file)
-        .unwrap();
+    let report = Extractor::new(dest.path()).unwrap().extract(zip_file).unwrap();
 
-    assert_eq!(report.dirs_created, 1);
+    assert_eq!(report.dirs_created, 2);
     assert_eq!(report.files_extracted, 1);
     assert!(dest.path().join("mydir").is_dir());
     assert!(dest.path().join("mydir/subdir/file.txt").exists());
@@ -455,11 +423,7 @@ fn test_sanitize_filenames() {
     match result {
         Err(Error::InvalidFilename { entry, reason }) => {
             assert_eq!(entry, "CON.txt");
-            assert!(
-                reason.contains("reserved"),
-                "reason should mention reserved: {}",
-                reason
-            );
+            assert!(reason.contains("reserved"), "reason should mention reserved: {}", reason);
             println!("✅ Successfully rejected '{}': {}", entry, reason);
         }
         _ => panic!("❌ Failed to reject reserved filename"),
@@ -665,11 +629,7 @@ fn test_backslash_rejection() {
 
     match result {
         Err(Error::InvalidFilename { entry, reason }) => {
-            assert!(
-                reason.contains("backslash"),
-                "Should mention backslash: {}",
-                reason
-            );
+            assert!(reason.contains("backslash"), "Should mention backslash: {}", reason);
             println!("✅ Rejected backslash in filename '{}': {}", entry, reason);
         }
         _ => panic!("❌ Should reject backslash in filename: {:?}", result),
@@ -690,11 +650,7 @@ fn test_null_byte_rejection() {
 
     match result {
         Err(Error::InvalidFilename { entry, reason }) => {
-            assert!(
-                reason.contains("control"),
-                "Should mention control chars: {}",
-                reason
-            );
+            assert!(reason.contains("control"), "Should mention control chars: {}", reason);
             println!("✅ Rejected null byte in filename '{}': {}", entry, reason);
         }
         _ => panic!("❌ Should reject null byte in filename: {:?}", result),
@@ -750,10 +706,8 @@ fn test_symlink_then_file_in_same_archive() {
     let zip = create_simple_zip("link", b"overwritten");
 
     // Step 3: Extract with Overwrite policy
-    let result = Extractor::new(dest.path())
-        .unwrap()
-        .overwrite(OverwritePolicy::Overwrite)
-        .extract(zip);
+    let result =
+        Extractor::new(dest.path()).unwrap().overwrite(OverwritePolicy::Overwrite).extract(zip);
 
     // Step 4: Verify the symlink was replaced with a file
     assert!(result.is_ok(), "Should succeed: {:?}", result);
@@ -768,10 +722,7 @@ fn test_symlink_then_file_in_same_archive() {
 
     // The original target should be unchanged (symlink was removed, not followed)
     let target_content = std::fs::read_to_string(&target_file).unwrap();
-    assert_eq!(
-        target_content, "original",
-        "Original target should be unchanged"
-    );
+    assert_eq!(target_content, "original", "Original target should be unchanged");
 
     println!("✅ Symlink replaced with file safely (didn't follow symlink)");
 }
@@ -848,10 +799,7 @@ fn test_url_encoded_traversal() {
             assert_eq!(report.files_extracted, 1);
             // It should NOT have escaped to parent
             let parent_evil = dest.path().parent().unwrap().join("evil.txt");
-            assert!(
-                !parent_evil.exists(),
-                "❌ URL-encoded traversal escaped jail!"
-            );
+            assert!(!parent_evil.exists(), "❌ URL-encoded traversal escaped jail!");
             println!("✅ URL-encoded traversal treated as literal filename");
         }
         Err(Error::PathEscape { .. }) | Err(Error::InvalidFilename { .. }) => {
@@ -877,10 +825,7 @@ fn test_double_encoded_traversal() {
         Ok(_) => {
             // If it succeeds, verify no escape happened
             let parent_evil = dest.path().parent().unwrap().join("evil.txt");
-            assert!(
-                !parent_evil.exists(),
-                "❌ Double-encoded traversal escaped!"
-            );
+            assert!(!parent_evil.exists(), "❌ Double-encoded traversal escaped!");
             println!("✅ Double-encoded traversal treated as literal");
         }
         Err(_) => {
@@ -938,10 +883,7 @@ fn test_trailing_space_in_filename() {
             // If allowed, the file should exist (with or without trailing space)
             let exists_with_space = dest.path().join("file.txt ").exists();
             let exists_without = dest.path().join("file.txt").exists();
-            assert!(
-                exists_with_space || exists_without,
-                "File should exist somewhere"
-            );
+            assert!(exists_with_space || exists_without, "File should exist somewhere");
             println!("✅ Trailing space handled (file exists)");
         }
         Err(Error::InvalidFilename { reason, .. }) => {
@@ -972,10 +914,7 @@ fn test_trailing_dot_in_filename() {
             // If allowed on Unix, file should exist with the dot
             let exists_with_dot = dest.path().join("file.txt.").exists();
             let exists_without = dest.path().join("file.txt").exists();
-            assert!(
-                exists_with_dot || exists_without,
-                "File should exist somewhere"
-            );
+            assert!(exists_with_dot || exists_without, "File should exist somewhere");
             println!("✅ Trailing dot handled (file exists)");
         }
         Err(Error::InvalidFilename { reason, .. }) => {
@@ -1164,10 +1103,7 @@ fn test_directory_only_archive() {
             assert!(dest.path().join("dir1").is_dir());
             assert!(dest.path().join("dir1/subdir").is_dir());
             assert!(dest.path().join("dir2").is_dir());
-            println!(
-                "✅ Directory-only archive: {} dirs created",
-                report.dirs_created
-            );
+            println!("✅ Directory-only archive: {} dirs created", report.dirs_created);
         }
         Err(e) => panic!("❌ Directory-only archive should succeed: {:?}", e),
     }
@@ -1240,11 +1176,11 @@ fn create_encrypted_zip() -> Vec<u8> {
 
     // Local file header signature
     zip.extend_from_slice(&[0x50, 0x4b, 0x03, 0x04]); // PK\x03\x04
-                                                      // Version needed to extract (2.0 = 20)
+    // Version needed to extract (2.0 = 20)
     zip.extend_from_slice(&[0x14, 0x00]);
     // General purpose bit flag - bit 0 set = encrypted
     zip.extend_from_slice(&[0x01, 0x00]); // Encrypted flag!
-                                          // Compression method (0 = stored)
+    // Compression method (0 = stored)
     zip.extend_from_slice(&[0x00, 0x00]);
     // Last mod time/date
     zip.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
@@ -1268,7 +1204,7 @@ fn create_encrypted_zip() -> Vec<u8> {
     // Central directory header
     let local_header_offset = 0u32;
     zip.extend_from_slice(&[0x50, 0x4b, 0x01, 0x02]); // PK\x01\x02
-                                                      // Version made by
+    // Version made by
     zip.extend_from_slice(&[0x14, 0x00]);
     // Version needed
     zip.extend_from_slice(&[0x14, 0x00]);
@@ -1306,7 +1242,7 @@ fn create_encrypted_zip() -> Vec<u8> {
 
     // End of central directory
     zip.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06]); // PK\x05\x06
-                                                      // Disk number
+    // Disk number
     zip.extend_from_slice(&[0x00, 0x00]);
     // Disk with CD
     zip.extend_from_slice(&[0x00, 0x00]);
@@ -1346,10 +1282,7 @@ fn test_zero_limits() {
     // Zero max_total_bytes
     let result = Extractor::new(dest.path())
         .unwrap()
-        .limits(Limits {
-            max_total_bytes: 0,
-            ..Limits::default()
-        })
+        .limits(Limits { max_total_bytes: 0, ..Limits::default() })
         .extract(make_zip());
 
     assert!(
@@ -1361,10 +1294,7 @@ fn test_zero_limits() {
     // Zero max_file_count
     let result = Extractor::new(dest.path())
         .unwrap()
-        .limits(Limits {
-            max_file_count: 0,
-            ..Limits::default()
-        })
+        .limits(Limits { max_file_count: 0, ..Limits::default() })
         .extract(make_zip());
 
     assert!(
@@ -1376,10 +1306,7 @@ fn test_zero_limits() {
     // Zero max_single_file
     let result = Extractor::new(dest.path())
         .unwrap()
-        .limits(Limits {
-            max_single_file: 0,
-            ..Limits::default()
-        })
+        .limits(Limits { max_single_file: 0, ..Limits::default() })
         .extract(make_zip());
 
     assert!(
@@ -1458,10 +1385,8 @@ fn test_duplicate_entry_with_overwrite_policy() {
 
     // Second extraction with Overwrite policy
     let zip2 = create_simple_zip("same.txt", b"second");
-    let result = Extractor::new(dest.path())
-        .unwrap()
-        .overwrite(OverwritePolicy::Overwrite)
-        .extract(zip2);
+    let result =
+        Extractor::new(dest.path()).unwrap().overwrite(OverwritePolicy::Overwrite).extract(zip2);
 
     match result {
         Ok(report) => {
@@ -1532,10 +1457,7 @@ fn test_path_canonicalization_current_dir() {
 
             // Most importantly: NOT outside the jail
             let parent_bar = dest.path().parent().unwrap().join("bar.txt");
-            assert!(
-                !parent_bar.exists(),
-                "❌ Escaped jail via canonicalization!"
-            );
+            assert!(!parent_bar.exists(), "❌ Escaped jail via canonicalization!");
 
             println!("✅ Path canonicalization handled safely");
         }
@@ -1636,10 +1558,7 @@ fn test_trailing_slash_directory() {
 
     match result {
         Ok(report) => {
-            assert!(
-                dest.path().join("mydir").is_dir(),
-                "Should create directory"
-            );
+            assert!(dest.path().join("mydir").is_dir(), "Should create directory");
             assert_eq!(report.files_extracted, 0, "No files, just directory");
             println!("✅ Trailing slash creates directory correctly");
         }
@@ -1721,9 +1640,7 @@ fn test_invalid_utf8_filename() {
     hacked_file.write_all(&buffer).unwrap();
     hacked_file.seek(std::io::SeekFrom::Start(0)).unwrap();
 
-    let result = safe_unzip::Extractor::new(dest.path())
-        .unwrap()
-        .extract(hacked_file);
+    let result = safe_unzip::Extractor::new(dest.path()).unwrap().extract(hacked_file);
 
     match result {
         Err(safe_unzip::Error::InvalidFilename { reason, .. }) => {
@@ -1747,10 +1664,7 @@ fn test_invalid_utf8_filename() {
                 actual_name
             );
 
-            assert!(
-                actual_name.ends_with(".txt"),
-                "Filename should still end with .txt"
-            );
+            assert!(actual_name.ends_with(".txt"), "Filename should still end with .txt");
         }
         Err(e) => panic!("❌ Unexpected error: {:?}", e),
     }
