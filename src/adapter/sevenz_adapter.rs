@@ -36,26 +36,49 @@ struct SevenZEntry {
 impl SevenZAdapter {
     /// Open a 7z file from a path.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
+        Self::open_with_password(path, None)
+    }
+
+    /// Open a 7z file from a path, decrypting with `password`.
+    ///
+    /// `None` opens the archive with an empty password, which only works for
+    /// unencrypted archives. Both encrypted headers and encrypted content
+    /// (7zAES) need the password supplied here.
+    pub fn open_with_password<P: AsRef<Path>>(
+        path: P,
+        password: Option<&str>,
+    ) -> Result<Self, Error> {
         let path = path.as_ref();
-        let entries = Self::decompress_all(path)?;
+        let entries = Self::decompress_all(path, password)?;
         Ok(Self { entries })
     }
 
     /// Open a 7z file from bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self, Error> {
+        Self::from_bytes_with_password(data, None)
+    }
+
+    /// Open a 7z file from bytes, decrypting with `password`.
+    pub fn from_bytes_with_password(data: &[u8], password: Option<&str>) -> Result<Self, Error> {
         // sevenz-rust requires a file path, so we write to a temp file
         let mut temp = tempfile::NamedTempFile::new()?;
         temp.write_all(data)?;
         temp.flush()?;
-        Self::open(temp.path())
+        Self::open_with_password(temp.path(), password)
     }
 
-    fn decompress_all(path: &Path) -> Result<Vec<SevenZEntry>, Error> {
+    fn decompress_all(path: &Path, password: Option<&str>) -> Result<Vec<SevenZEntry>, Error> {
         let mut entries = Vec::new();
 
+        // Password::from(&str) does the UTF-16LE encoding that 7zAES expects
+        let password = match password {
+            Some(p) => sevenz_rust2::Password::from(p),
+            None => sevenz_rust2::Password::empty(),
+        };
+
         // Use the lower-level API to iterate entries
-        let mut archive = sevenz_rust2::ArchiveReader::open(path, sevenz_rust2::Password::empty())
-            .map_err(|e| Error::Io(std::io::Error::other(format!("7z open error: {}", e))))?;
+        let mut archive = sevenz_rust2::ArchiveReader::open(path, password)
+            .map_err(|e| map_7z_error("open", e))?;
 
         // Iterate through all entries
         archive
@@ -83,7 +106,7 @@ impl SevenZAdapter {
                 entries.push(SevenZEntry { info, data });
                 Ok(true)
             })
-            .map_err(|e| Error::Io(std::io::Error::other(format!("7z read error: {}", e))))?;
+            .map_err(|e| map_7z_error("read", e))?;
 
         Ok(entries)
     }
@@ -120,5 +143,23 @@ impl SevenZAdapter {
             }
         }
         Ok(())
+    }
+}
+
+/// Map a sevenz-rust2 error into our own error type.
+///
+/// The crate reports "no password given" and "wrong password" as ordinary
+/// errors (`PasswordRequired`, `MaybeBadPassword`), which is confusing when it
+/// surfaces as a bare I/O error, so those get a clearer message. Generic over
+/// `Display` to avoid naming sevenz-rust2's error type here.
+fn map_7z_error<E: std::fmt::Display>(stage: &str, e: E) -> Error {
+    let text = e.to_string();
+    if text.to_ascii_lowercase().contains("password") {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("7z {} error: wrong or missing password ({})", stage, text),
+        ))
+    } else {
+        Error::Io(std::io::Error::other(format!("7z {} error: {}", stage, text)))
     }
 }

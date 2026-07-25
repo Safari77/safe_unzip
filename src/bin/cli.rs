@@ -416,12 +416,12 @@ fn process_archive(cli: &mut Cli, archive: &Path, config: &Config) -> Result<(),
 
     // List mode
     if cli.list {
-        return list_archive(archive, format, cli.quiet);
+        return list_archive(archive, format, cli.quiet, cli.password.as_deref());
     }
 
     // Verify mode
     if cli.verify {
-        return verify_archive(archive, format, cli.quiet);
+        return verify_archive(archive, format, cli.quiet, cli.password.as_deref());
     }
 
     match format {
@@ -759,9 +759,12 @@ fn extract_sevenz(cli: &Cli, archive: &Path, config: &Config) -> Result<(), Erro
         driver = driver.exclude_glob(&cli.exclude_patterns);
     }
 
+    // Decompress once, with the password resolved earlier, and reuse the
+    // adapter for both the progress total and the extraction itself
+    let adapter = safe_unzip::SevenZAdapter::open_with_password(archive, cli.password.as_deref())?;
+
     if cli.verbose {
         // We know total entries for 7z because it decompresses upfront
-        let adapter = safe_unzip::SevenZAdapter::open(archive)?;
         let total_entries = adapter.len();
 
         driver = driver.on_progress(move |p| {
@@ -780,7 +783,7 @@ fn extract_sevenz(cli: &Cli, archive: &Path, config: &Config) -> Result<(), Erro
         });
     }
 
-    let report = driver.extract_7z_file(archive)?;
+    let report = driver.extract_7z(adapter)?;
 
     if !cli.quiet {
         println!(
@@ -803,7 +806,15 @@ fn extract_sevenz(cli: &Cli, archive: &Path, config: &Config) -> Result<(), Erro
     Ok(())
 }
 
-fn list_archive(path: &Path, format: ArchiveFormat, quiet: bool) -> Result<(), Error> {
+fn list_archive(
+    path: &Path,
+    format: ArchiveFormat,
+    quiet: bool,
+    password: Option<&str>,
+) -> Result<(), Error> {
+    #[cfg(not(feature = "sevenz"))]
+    let _ = password;
+
     let safe_archive_path = sanitize_for_terminal(&path.to_string_lossy());
 
     match format {
@@ -872,7 +883,7 @@ fn list_archive(path: &Path, format: ArchiveFormat, quiet: bool) -> Result<(), E
         ArchiveFormat::SevenZ => {
             #[cfg(feature = "sevenz")]
             {
-                let adapter = safe_unzip::SevenZAdapter::open(path)?;
+                let adapter = safe_unzip::SevenZAdapter::open_with_password(path, password)?;
                 let entries = adapter.entries_metadata();
 
                 if !quiet {
@@ -914,7 +925,15 @@ fn list_archive(path: &Path, format: ArchiveFormat, quiet: bool) -> Result<(), E
     Ok(())
 }
 
-fn verify_archive(path: &Path, format: ArchiveFormat, quiet: bool) -> Result<(), Error> {
+fn verify_archive(
+    path: &Path,
+    format: ArchiveFormat,
+    quiet: bool,
+    password: Option<&str>,
+) -> Result<(), Error> {
+    #[cfg(not(feature = "sevenz"))]
+    let _ = password;
+
     let safe_archive_path = sanitize_for_terminal(&path.to_string_lossy());
 
     if !quiet {
@@ -951,7 +970,7 @@ fn verify_archive(path: &Path, format: ArchiveFormat, quiet: bool) -> Result<(),
             #[cfg(feature = "sevenz")]
             {
                 // SevenZAdapter decompresses fully on open, effectively verifying integrity
-                let adapter = safe_unzip::SevenZAdapter::open(path)?;
+                let adapter = safe_unzip::SevenZAdapter::open_with_password(path, password)?;
                 let entries = adapter.entries_metadata();
                 let total_size: u64 = entries.iter().map(|e| e.size).sum();
 
@@ -1034,16 +1053,17 @@ fn resolve_password(
 
     // 1. Try passwords from config
     if let Some(passwords_config) = &config.passwords
-        && let Some(list) = &passwords_config.list {
-            if verbose {
-                println!("Checking passwords from config...");
-            }
-            for pwd in list {
-                if verify_password(archive, format, pwd) {
-                    return Some(pwd.clone());
-                }
+        && let Some(list) = &passwords_config.list
+    {
+        if verbose {
+            println!("Checking passwords from config...");
+        }
+        for pwd in list {
+            if verify_password(archive, format, pwd) {
+                return Some(pwd.clone());
             }
         }
+    }
 
     // 2. Prompt user securely
     eprint!("Archive is encrypted. Enter password: ");
@@ -1082,7 +1102,52 @@ fn requires_password(path: &Path, format: &ArchiveFormat) -> bool {
             false
         }
         ArchiveFormat::Tar | ArchiveFormat::TarGz => false,
-        ArchiveFormat::SevenZ => true,
+        ArchiveFormat::SevenZ => {
+            #[cfg(feature = "sevenz")]
+            {
+                sevenz_requires_password(path)
+            }
+            #[cfg(not(feature = "sevenz"))]
+            {
+                false
+            }
+        }
+    }
+}
+
+/// Check whether a 7z archive actually needs a password.
+///
+/// Encrypted headers make `open()` fail outright. With plaintext headers the
+/// open succeeds regardless, so we have to read a byte of real content to find
+/// out whether the streams are 7zAES-encrypted.
+#[cfg(feature = "sevenz")]
+fn sevenz_requires_password(path: &Path) -> bool {
+    use sevenz_rust2::{ArchiveReader, Password};
+
+    match ArchiveReader::open(path, Password::empty()) {
+        Ok(mut archive) => {
+            let mut needs = false;
+            let res = archive.for_each_entries(|entry, reader| {
+                if entry.is_directory() {
+                    return Ok(true);
+                }
+                let mut buf = [0u8; 1];
+                match reader.read(&mut buf) {
+                    Err(_) => {
+                        needs = true;
+                        Ok(false)
+                    }
+                    // Empty file tells us nothing, look at the next entry
+                    Ok(0) => Ok(true),
+                    // Content decrypted (or was never encrypted)
+                    Ok(_) => Ok(false),
+                }
+            });
+            needs || res.is_err()
+        }
+        // Encrypted header, or an archive we cannot read at all: prompting is
+        // the more useful of the two failure modes
+        Err(_) => true,
     }
 }
 
@@ -1136,26 +1201,42 @@ fn verify_7z_password(path: &Path, password: &str) -> bool {
             // 2. If open succeeded (headers OK), we must verify content decryption.
             // If headers are NOT encrypted, open() succeeds with ANY password.
             // So we must try to read at least one file's content.
-            let _ = archive.for_each_entries(|entry, reader| {
-                if !entry.is_directory() {
-                    found_file = true;
-                    // Try to read 1 byte to trigger decryption/MAC check
-                    let mut buf = [0u8; 1];
-                    match reader.read(&mut buf) {
-                        Ok(_) => valid = true,
-                        Err(_) => valid = false,
-                    }
-                    // Stop after checking the first file
-                    return Ok(false);
+            // Empty files decrypt trivially and prove nothing, so keep looking
+            // until an entry actually yields a byte.
+            let res = archive.for_each_entries(|entry, reader| {
+                if entry.is_directory() {
+                    return Ok(true); // Skip directories
                 }
-                Ok(true) // Skip directories
+
+                // Try to read some bytes to trigger decryption/decode
+                let mut buf = [0u8; 4096];
+                match reader.read(&mut buf) {
+                    Err(_) => {
+                        found_file = true;
+                        valid = false;
+                        Ok(false) // Wrong password, no point continuing
+                    }
+                    Ok(0) => Ok(true), // Empty file, inconclusive: try the next entry
+                    Ok(_) => {
+                        found_file = true;
+                        valid = true;
+                        Ok(false) // Stop after the first entry with real content
+                    }
+                }
             });
+
+            // An error from the iteration itself (AES or LZMA2 failure while
+            // setting up the next folder) also means the password is wrong.
+            if res.is_err() {
+                return false;
+            }
 
             // If we found a file and read it successfully, password is correct.
             if found_file {
                 valid
             } else {
-                // If archive is empty or only has dirs, and we opened it, assume password is OK
+                // Only dirs and/or empty files: nothing encrypted to check, and
+                // we did open the archive, so assume the password is OK
                 true
             }
         }
