@@ -17,9 +17,10 @@ members = [".", "python"]
 [features]
 default = ["cli", "tar", "sevenz"]
 tar = ["dep:tar", "dep:flate2"]  # Enable tar/tar.gz support
-async = ["tokio"]
+async = ["dep:tokio"]
 sevenz = ["dep:sevenz-rust2", "dep:tempfile"]  # Enable 7z support
-cli = ["clap", "clap_complete", "tar"]  # CLI includes TAR support by default
+# CLI includes TAR support by default; tempfile spools non-seekable stdin
+cli = ["dep:clap", "dep:clap_complete", "dep:tempfile", "tar"]
 
 [[bin]]
 name = "safe_unzip"

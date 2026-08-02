@@ -1,7 +1,7 @@
 //! TAR archive adapter.
 
 use std::fs::File;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read};
 use std::path::Path;
 
 use flate2::read::GzDecoder;
@@ -103,9 +103,27 @@ impl<R: Read> TarAdapter<R> {
     ///
     /// This is used by `ValidateFirst` mode to check all entries
     /// before extracting any. The data is cached for later extraction.
+    ///
+    /// Note that this buffers the whole archive in memory. Prefer
+    /// [`Self::cache_all_limited`] so a malicious archive cannot exhaust RAM
+    /// before the policy chain gets a chance to reject it.
     pub fn cache_all(&mut self) -> Result<Vec<EntryInfo>, Error> {
+        self.cache_all_limited(u64::MAX, u64::MAX)
+    }
+
+    /// Read all entries into memory, refusing archives larger than the limits.
+    ///
+    /// `ValidateFirst` has to buffer content before it can validate it, so the
+    /// size limits are enforced here as well as in the policy chain -- otherwise
+    /// a tar bomb would OOM the process before any policy ran.
+    pub fn cache_all_limited(
+        &mut self,
+        max_single_file: u64,
+        max_total_bytes: u64,
+    ) -> Result<Vec<EntryInfo>, Error> {
         let mut entries = Vec::new();
         let mut cached = Vec::new();
+        let mut total_bytes: u64 = 0;
 
         let tar_entries = self.archive.entries()?;
 
@@ -146,7 +164,30 @@ impl<R: Read> TarAdapter<R> {
             // Read file content into memory
             let mut data = Vec::new();
             if matches!(kind, EntryKind::File) {
-                entry.read_to_end(&mut data)?;
+                if info.size > max_single_file {
+                    return Err(Error::FileTooLarge {
+                        entry: name,
+                        limit: max_single_file,
+                        size: info.size,
+                    });
+                }
+
+                let would_be = total_bytes.saturating_add(info.size);
+                if would_be > max_total_bytes {
+                    return Err(Error::TotalSizeExceeded { limit: max_total_bytes, would_be });
+                }
+
+                // Read at most the declared size: a header that understates the
+                // real content must not be able to grow the buffer past the limit.
+                let read = super::copy_limited(&mut entry, &mut data, info.size)?;
+                if read == info.size && super::has_more_data(&mut entry)? {
+                    return Err(Error::SizeMismatch {
+                        entry: name,
+                        declared: info.size,
+                        actual: read.saturating_add(1),
+                    });
+                }
+                total_bytes = total_bytes.saturating_add(read);
             }
 
             entries.push(info.clone());
@@ -199,34 +240,6 @@ impl TarAdapter<GzDecoder<BufReader<File>>> {
         let decoder = GzDecoder::new(reader);
         Ok(Self::new(decoder))
     }
-}
-
-/// Helper to copy with a byte limit.
-pub fn copy_limited<R: Read + ?Sized, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    limit: u64,
-) -> Result<u64, Error> {
-    let mut total = 0u64;
-    let mut buf = [0u8; 8192];
-
-    loop {
-        let remaining = limit.saturating_sub(total);
-        if remaining == 0 {
-            break;
-        }
-
-        let to_read = buf.len().min(remaining as usize);
-        let n = reader.read(&mut buf[..to_read])?;
-        if n == 0 {
-            break;
-        }
-
-        writer.write_all(&buf[..n])?;
-        total += n as u64;
-    }
-
-    Ok(total)
 }
 
 /// Convert TAR entry type to a human-readable name.

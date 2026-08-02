@@ -18,6 +18,10 @@
 //! # List contents without extracting
 //! safe_unzip archive.zip --list
 //!
+//! # Read the archive from stdin (format is sniffed from the magic bytes)
+//! cat archive.tar.gz | safe_unzip - -d /tmp/out
+//! ssh host 'tar cf - /srv/data' | safe_unzip - -d /tmp/out --format tar
+//!
 //! # Generate shell completions
 //! safe_unzip --completions bash > ~/.bash_completion.d/safe_unzip
 //! safe_unzip --completions zsh > ~/.zfunc/_safe_unzip
@@ -27,6 +31,7 @@
 use clap::{CommandFactory, Parser, ValueEnum};
 use clap_complete::{Shell, generate};
 use std::io;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use unicode_segmentation::UnicodeSegmentation;
@@ -136,7 +141,7 @@ struct LimitsConfig {
     safe_unzip archive.zip --list"
 )]
 struct Cli {
-    /// Archive files to extract (ZIP, TAR, TAR.GZ)
+    /// Archive files to extract (ZIP, TAR, TAR.GZ, 7Z). Use "-" to read from stdin
     #[arg(required_unless_present = "completions")]
     archives: Vec<PathBuf>,
 
@@ -247,6 +252,10 @@ struct Cli {
     /// Password for encrypted archives
     #[arg(long)]
     password: Option<String>,
+
+    /// Archive format (default: from the file name, or from content on stdin)
+    #[arg(long, value_enum, default_value_t = FormatOpt::Auto)]
+    format: FormatOpt,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -287,10 +296,35 @@ fn parse_size(s: &str) -> Result<u64, String> {
         let num_str = s.trim_end_matches("KB").trim_end_matches('K');
         (num_str, 1024)
     } else {
-        (s.as_str(), 1)
+        (s.trim_end_matches('B'), 1)
     };
 
-    num.parse::<u64>().map(|n| n * multiplier).map_err(|_| format!("Invalid size: {}", s))
+    let value: u64 = num.trim().parse().map_err(|_| format!("Invalid size: {}", s))?;
+    value.checked_mul(multiplier).ok_or_else(|| format!("Size out of range: {}", s))
+}
+
+/// Resolve the effective limits from the command line, then the config file,
+/// then the built-in defaults.
+fn build_limits(cli: &Cli, config: &Config) -> Limits {
+    let def = Limits::default();
+    Limits {
+        max_total_bytes: cli.max_size.unwrap_or(def.max_total_bytes),
+        max_file_count: cli
+            .max_files
+            .or_else(|| config.limits.as_ref().and_then(|l| l.files))
+            .unwrap_or(def.max_file_count),
+        max_dir_count: cli
+            .max_dirs
+            .or_else(|| config.limits.as_ref().and_then(|l| l.dirs))
+            .unwrap_or(def.max_dir_count),
+        max_renames: cli
+            .max_renames
+            .or_else(|| config.limits.as_ref().and_then(|l| l.renames))
+            .unwrap_or(def.max_renames),
+        max_single_file: cli.max_single_file.unwrap_or(def.max_single_file),
+        max_path_depth: cli.max_depth.unwrap_or(def.max_path_depth),
+        max_path_len: cli.max_path_len.unwrap_or(def.max_path_len),
+    }
 }
 
 fn detect_format(path: &Path) -> ArchiveFormat {
@@ -307,11 +341,86 @@ fn detect_format(path: &Path) -> ArchiveFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArchiveFormat {
     Zip,
     Tar,
     TarGz,
     SevenZ,
+}
+
+/// Explicit `--format` selection. `Auto` keeps the existing behaviour: guess
+/// from the file name, or from the magic bytes when reading stdin.
+#[derive(Clone, Copy, ValueEnum)]
+enum FormatOpt {
+    /// Detect from the file name, or from the content when reading stdin
+    Auto,
+    Zip,
+    Tar,
+    /// gzip-compressed tar (.tar.gz, .tgz)
+    #[value(name = "tar.gz", alias = "tgz")]
+    TarGz,
+    #[value(name = "7z")]
+    SevenZ,
+}
+
+impl FormatOpt {
+    fn to_archive_format(self) -> Option<ArchiveFormat> {
+        match self {
+            FormatOpt::Auto => None,
+            FormatOpt::Zip => Some(ArchiveFormat::Zip),
+            FormatOpt::Tar => Some(ArchiveFormat::Tar),
+            FormatOpt::TarGz => Some(ArchiveFormat::TarGz),
+            FormatOpt::SevenZ => Some(ArchiveFormat::SevenZ),
+        }
+    }
+}
+
+/// Bytes sniffed from stdin to identify the archive format. The TAR "ustar"
+/// magic sits at offset 257, so a whole header block is needed.
+const SNIFF_LEN: usize = 512;
+
+/// Names that mean "read the archive from standard input".
+fn is_stdin_path(path: &Path) -> bool {
+    matches!(path.to_str(), Some("-") | Some("/dev/stdin") | Some("/proc/self/fd/0"))
+}
+
+/// Fill `buf` as far as the reader allows. A pipe hands back short reads, so a
+/// single `read()` is not enough to see the TAR magic.
+fn read_upto<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+    let mut total = 0;
+    while total < buf.len() {
+        match reader.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(total)
+}
+
+/// Identify an archive from its leading bytes.
+fn sniff_format(header: &[u8]) -> Option<ArchiveFormat> {
+    // Local file header, end of central directory, or spanned marker
+    if header.starts_with(b"PK\x03\x04")
+        || header.starts_with(b"PK\x05\x06")
+        || header.starts_with(b"PK\x07\x08")
+    {
+        return Some(ArchiveFormat::Zip);
+    }
+    if header.starts_with(&[0x1f, 0x8b]) {
+        return Some(ArchiveFormat::TarGz);
+    }
+    if header.starts_with(&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]) {
+        return Some(ArchiveFormat::SevenZ);
+    }
+    // POSIX ("ustar\0") and GNU ("ustar  ") both carry the magic at offset 257.
+    // Pre-POSIX V7 tars have no magic at all and need an explicit --format.
+    if header.len() >= 262 && &header[257..262] == b"ustar" {
+        return Some(ArchiveFormat::Tar);
+    }
+    None
 }
 
 fn load_config(verbose: bool) -> Config {
@@ -372,11 +481,14 @@ fn run(mut cli: Cli) -> Result<(), Error> {
     let mut error_count = 0;
 
     for archive in &archives {
-        let size = std::fs::metadata(archive).map(|m| m.len()).unwrap_or(0);
-
         if !cli.quiet {
-            let safe_archive_name = sanitize_for_terminal(&archive.to_string_lossy());
-            println!("Processing {} ({} bytes).", safe_archive_name, size);
+            if is_stdin_path(archive) {
+                println!("Processing standard input.");
+            } else {
+                let size = std::fs::metadata(archive).map(|m| m.len()).unwrap_or(0);
+                let safe_archive_name = sanitize_for_terminal(&archive.to_string_lossy());
+                println!("Processing {} ({} bytes).", safe_archive_name, size);
+            }
         }
 
         match process_archive(&mut cli, archive, &config) {
@@ -408,20 +520,39 @@ fn run(mut cli: Cli) -> Result<(), Error> {
 }
 
 fn process_archive(cli: &mut Cli, archive: &Path, config: &Config) -> Result<(), Error> {
-    let format = detect_format(archive);
-
-    if cli.password.is_none() {
-        cli.password = resolve_password(archive, &format, cli.verbose, config);
+    if is_stdin_path(archive) {
+        return process_stdin(cli, config);
     }
+
+    let format = cli.format.to_archive_format().unwrap_or_else(|| detect_format(archive));
+    process_path(cli, archive, format, config, true)
+}
+
+/// Handle an archive that exists as a real file.
+///
+/// `allow_prompt` is false when the archive itself arrived on stdin: there is
+/// no longer a usable stdin to read a password from.
+fn process_path(
+    cli: &mut Cli,
+    archive: &Path,
+    format: ArchiveFormat,
+    config: &Config,
+    allow_prompt: bool,
+) -> Result<(), Error> {
+    if cli.password.is_none() {
+        cli.password = resolve_password(archive, &format, cli.verbose, config, allow_prompt);
+    }
+
+    let max_bytes = build_limits(cli, config).max_total_bytes;
 
     // List mode
     if cli.list {
-        return list_archive(archive, format, cli.quiet, cli.password.as_deref());
+        return list_archive(archive, format, cli.quiet, cli.password.as_deref(), max_bytes);
     }
 
     // Verify mode
     if cli.verify {
-        return verify_archive(archive, format, cli.quiet, cli.password.as_deref());
+        return verify_archive(archive, format, cli.quiet, cli.password.as_deref(), max_bytes);
     }
 
     match format {
@@ -444,26 +575,84 @@ fn process_archive(cli: &mut Cli, archive: &Path, config: &Config) -> Result<(),
     }
 }
 
-fn extract_zip(cli: &Cli, archive: &Path, config: &Config) -> Result<(), Error> {
-    let def = Limits::default();
-    let limits = Limits {
-        max_total_bytes: cli.max_size.unwrap_or(def.max_total_bytes),
-        max_file_count: cli
-            .max_files
-            .or_else(|| config.limits.as_ref().and_then(|l| l.files))
-            .unwrap_or(def.max_file_count),
-        max_dir_count: cli
-            .max_dirs
-            .or_else(|| config.limits.as_ref().and_then(|l| l.dirs))
-            .unwrap_or(def.max_dir_count),
-        max_renames: cli
-            .max_renames
-            .or_else(|| config.limits.as_ref().and_then(|l| l.renames))
-            .unwrap_or(def.max_renames),
-        max_single_file: cli.max_single_file.unwrap_or(def.max_single_file),
-        max_path_depth: cli.max_depth.unwrap_or(def.max_path_depth),
-        max_path_len: cli.max_path_len.unwrap_or(def.max_path_len),
+/// Read an archive from standard input.
+///
+/// TAR is a sequential format, so it is streamed straight through. ZIP needs
+/// the central directory at the end of the file and 7z needs random access, so
+/// those are spooled to a temporary file first.
+fn process_stdin(cli: &mut Cli, config: &Config) -> Result<(), Error> {
+    let stdin = io::stdin();
+    let mut reader = io::BufReader::with_capacity(65536, stdin.lock());
+
+    let mut header = vec![0u8; SNIFF_LEN];
+    let read = read_upto(&mut reader, &mut header)?;
+    header.truncate(read);
+
+    let format = match cli.format.to_archive_format() {
+        Some(explicit) => explicit,
+        None => sniff_format(&header).ok_or_else(|| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot identify the archive format on stdin (pre-POSIX tar has no magic bytes); pass --format",
+            ))
+        })?,
     };
+
+    // Put the sniffed bytes back at the front of the stream
+    let mut stream = io::Cursor::new(header).chain(reader);
+
+    match format {
+        ArchiveFormat::Tar => run_tar_stream(cli, config, stream),
+        ArchiveFormat::TarGz => run_tar_stream(cli, config, flate2::read::GzDecoder::new(stream)),
+        ArchiveFormat::Zip | ArchiveFormat::SevenZ => {
+            let mut temp = tempfile::NamedTempFile::new()?;
+            io::copy(&mut stream, temp.as_file_mut())?;
+            let path = temp.path().to_path_buf();
+            process_path(cli, &path, format, config, false)
+        }
+    }
+}
+
+/// Extract, list or verify a TAR stream that cannot be seeked.
+fn run_tar_stream<R: Read>(cli: &Cli, config: &Config, reader: R) -> Result<(), Error> {
+    if cli.list {
+        let entries = safe_unzip::list_tar(reader)?;
+        print_entries(&entries, "standard input", cli.quiet);
+        return Ok(());
+    }
+
+    if cli.verify {
+        if !cli.quiet {
+            println!("Verifying standard input...");
+        }
+        // TAR carries no payload checksum, so walking every entry is the
+        // strongest integrity check the format allows
+        let entries = safe_unzip::list_tar(reader)?;
+        if !cli.quiet {
+            println!(
+                "Verified {} entries ({})",
+                entries.len(),
+                format_bytes(total_entry_size(&entries))
+            );
+        }
+        return Ok(());
+    }
+
+    let driver = build_tar_driver(cli, config)?;
+    let report = driver.extract_tar(safe_unzip::TarAdapter::new(reader))?;
+
+    report_extraction(
+        cli,
+        report.files_extracted,
+        report.bytes_written,
+        report.entries_skipped,
+        &report.renames,
+    );
+    Ok(())
+}
+
+fn extract_zip(cli: &Cli, archive: &Path, config: &Config) -> Result<(), Error> {
+    let limits = build_limits(cli, config);
 
     let overwrite = match cli.overwrite {
         OverwriteMode::Error => OverwritePolicy::Error,
@@ -530,52 +719,80 @@ fn extract_zip(cli: &Cli, archive: &Path, config: &Config) -> Result<(), Error> 
 
     let report = extractor.extract_file(archive)?;
 
-    if !cli.quiet {
-        println!(
-            "Extracted {} files ({} bytes) to {}",
-            report.files_extracted,
-            format_bytes(report.bytes_written),
-            cli.dest.display()
-        );
-        if !report.renames.is_empty() {
-            println!("\nThe following files were renamed to avoid overwriting:");
-            for (orig, new) in report.renames {
-                println!("  {} -> {}", sanitize_for_terminal(&orig), sanitize_for_terminal(&new));
-            }
-        }
-        if report.entries_skipped > 0 {
-            println!("Skipped {} entries", report.entries_skipped);
-        }
-    }
+    report_extraction(
+        cli,
+        report.files_extracted,
+        report.bytes_written,
+        report.entries_skipped,
+        &report.renames,
+    );
 
     Ok(())
 }
 
-fn extract_tar(
+/// Print the post-extraction summary shared by every format.
+fn report_extraction(
     cli: &Cli,
-    archive: &Path,
-    format: ArchiveFormat,
-    config: &Config,
-) -> Result<(), Error> {
-    let def = Limits::default();
-    let limits = Limits {
-        max_total_bytes: cli.max_size.unwrap_or(def.max_total_bytes),
-        max_file_count: cli
-            .max_files
-            .or_else(|| config.limits.as_ref().and_then(|l| l.files))
-            .unwrap_or(def.max_file_count),
-        max_dir_count: cli
-            .max_dirs
-            .or_else(|| config.limits.as_ref().and_then(|l| l.dirs))
-            .unwrap_or(def.max_dir_count),
-        max_renames: cli
-            .max_renames
-            .or_else(|| config.limits.as_ref().and_then(|l| l.renames))
-            .unwrap_or(def.max_renames),
-        max_single_file: cli.max_single_file.unwrap_or(def.max_single_file),
-        max_path_depth: cli.max_depth.unwrap_or(def.max_path_depth),
-        max_path_len: cli.max_path_len.unwrap_or(def.max_path_len),
-    };
+    files_extracted: usize,
+    bytes_written: u64,
+    entries_skipped: usize,
+    renames: &[(String, String)],
+) {
+    if cli.quiet {
+        return;
+    }
+
+    println!(
+        "Extracted {} files ({} bytes) to {}",
+        files_extracted,
+        format_bytes(bytes_written),
+        cli.dest.display()
+    );
+    if !renames.is_empty() {
+        println!("\nThe following files were renamed to avoid overwriting:");
+        for (orig, new) in renames {
+            println!("  {} -> {}", sanitize_for_terminal(orig), sanitize_for_terminal(new));
+        }
+    }
+    if entries_skipped > 0 {
+        println!("Skipped {} entries", entries_skipped);
+    }
+}
+
+/// Sum entry sizes without panicking on a hostile archive.
+fn total_entry_size(entries: &[safe_unzip::EntryInfo]) -> u64 {
+    entries.iter().fold(0u64, |acc, e| acc.saturating_add(e.size))
+}
+
+/// Print an entry listing for one archive.
+fn print_entries(entries: &[safe_unzip::EntryInfo], source: &str, quiet: bool) {
+    if !quiet {
+        println!("{} entries in {}:", entries.len(), source);
+        println!();
+    }
+
+    for entry in entries {
+        let kind = match entry.kind {
+            safe_unzip::EntryKind::File => "",
+            safe_unzip::EntryKind::Directory => "/",
+            safe_unzip::EntryKind::Symlink { .. } => " -> [symlink]",
+        };
+        println!(
+            "{:>10}  {}{}",
+            format_bytes(entry.size),
+            sanitize_for_terminal(&entry.name),
+            kind
+        );
+    }
+
+    if !quiet {
+        println!();
+        println!("Total: {} files, {}", entries.len(), format_bytes(total_entry_size(entries)));
+    }
+}
+
+fn build_tar_driver(cli: &Cli, config: &Config) -> Result<Driver, Error> {
+    let limits = build_limits(cli, config);
 
     let overwrite_mode = match cli.overwrite {
         OverwriteMode::Error => safe_unzip::OverwriteMode::Error,
@@ -603,6 +820,7 @@ fn extract_tar(
         .validation(validation)
         .junk_paths(cli.junk_paths)
         .fsync(cli.fsync)
+        .allow_windows_reserved(cli.allow_windows_reserved)
         .restore_timestamps(cli.restore_timestamps);
 
     if let Some(m) = cli.file_mode {
@@ -650,67 +868,42 @@ fn extract_tar(
         });
     }
 
+    Ok(driver)
+}
+
+fn extract_tar(
+    cli: &Cli,
+    archive: &Path,
+    format: ArchiveFormat,
+    config: &Config,
+) -> Result<(), Error> {
+    let driver = build_tar_driver(cli, config)?;
+
     let report = match format {
         ArchiveFormat::Tar => driver.extract_tar_file(archive)?,
         ArchiveFormat::TarGz => driver.extract_tar_gz_file(archive)?,
-        ArchiveFormat::SevenZ => {
-            #[cfg(feature = "sevenz")]
-            {
-                driver.extract_7z_file(archive)?
-            }
-            #[cfg(not(feature = "sevenz"))]
-            {
-                return Err(Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "7z not supported",
-                )));
-            }
+        other => {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("extract_tar called with a non-TAR format ({:?})", other),
+            )));
         }
-        _ => unreachable!(),
     };
 
-    if !cli.quiet {
-        println!(
-            "Extracted {} files ({} bytes) to {}",
-            report.files_extracted,
-            format_bytes(report.bytes_written),
-            cli.dest.display()
-        );
-        if !report.renames.is_empty() {
-            println!("\nThe following files were renamed to avoid overwriting:");
-            for (orig, new) in report.renames {
-                println!("  {} -> {}", sanitize_for_terminal(&orig), sanitize_for_terminal(&new));
-            }
-        }
-        if report.entries_skipped > 0 {
-            println!("Skipped {} entries", report.entries_skipped);
-        }
-    }
+    report_extraction(
+        cli,
+        report.files_extracted,
+        report.bytes_written,
+        report.entries_skipped,
+        &report.renames,
+    );
 
     Ok(())
 }
 
 #[cfg(feature = "sevenz")]
 fn extract_sevenz(cli: &Cli, archive: &Path, config: &Config) -> Result<(), Error> {
-    let def = Limits::default();
-    let limits = Limits {
-        max_total_bytes: cli.max_size.unwrap_or(def.max_total_bytes),
-        max_file_count: cli
-            .max_files
-            .or_else(|| config.limits.as_ref().and_then(|l| l.files))
-            .unwrap_or(def.max_file_count),
-        max_dir_count: cli
-            .max_dirs
-            .or_else(|| config.limits.as_ref().and_then(|l| l.dirs))
-            .unwrap_or(def.max_dir_count),
-        max_renames: cli
-            .max_renames
-            .or_else(|| config.limits.as_ref().and_then(|l| l.renames))
-            .unwrap_or(def.max_renames),
-        max_single_file: cli.max_single_file.unwrap_or(def.max_single_file),
-        max_path_depth: cli.max_depth.unwrap_or(def.max_path_depth),
-        max_path_len: cli.max_path_len.unwrap_or(def.max_path_len),
-    };
+    let limits = build_limits(cli, config);
 
     // Map policies to Driver types
     let overwrite_mode = match cli.overwrite {
@@ -739,6 +932,7 @@ fn extract_sevenz(cli: &Cli, archive: &Path, config: &Config) -> Result<(), Erro
         .validation(validation)
         .junk_paths(cli.junk_paths)
         .fsync(cli.fsync)
+        .allow_windows_reserved(cli.allow_windows_reserved)
         .restore_timestamps(cli.restore_timestamps);
 
     if let Some(m) = cli.file_mode {
@@ -761,7 +955,11 @@ fn extract_sevenz(cli: &Cli, archive: &Path, config: &Config) -> Result<(), Erro
 
     // Decompress once, with the password resolved earlier, and reuse the
     // adapter for both the progress total and the extraction itself
-    let adapter = safe_unzip::SevenZAdapter::open_with_password(archive, cli.password.as_deref())?;
+    let adapter = safe_unzip::SevenZAdapter::open_with_limit(
+        archive,
+        cli.password.as_deref(),
+        limits.max_total_bytes,
+    )?;
 
     if cli.verbose {
         // We know total entries for 7z because it decompresses upfront
@@ -785,23 +983,13 @@ fn extract_sevenz(cli: &Cli, archive: &Path, config: &Config) -> Result<(), Erro
 
     let report = driver.extract_7z(adapter)?;
 
-    if !cli.quiet {
-        println!(
-            "Extracted {} files ({} bytes) to {}",
-            report.files_extracted,
-            format_bytes(report.bytes_written),
-            cli.dest.display()
-        );
-        if !report.renames.is_empty() {
-            println!("\nThe following files were renamed to avoid overwriting:");
-            for (orig, new) in report.renames {
-                println!("  {} -> {}", sanitize_for_terminal(&orig), sanitize_for_terminal(&new));
-            }
-        }
-        if report.entries_skipped > 0 {
-            println!("Skipped {} entries", report.entries_skipped);
-        }
-    }
+    report_extraction(
+        cli,
+        report.files_extracted,
+        report.bytes_written,
+        report.entries_skipped,
+        &report.renames,
+    );
 
     Ok(())
 }
@@ -811,116 +999,36 @@ fn list_archive(
     format: ArchiveFormat,
     quiet: bool,
     password: Option<&str>,
+    max_bytes: u64,
 ) -> Result<(), Error> {
     #[cfg(not(feature = "sevenz"))]
-    let _ = password;
+    let _ = (password, max_bytes);
 
     let safe_archive_path = sanitize_for_terminal(&path.to_string_lossy());
 
-    match format {
-        ArchiveFormat::Zip => {
-            let entries = safe_unzip::list_zip_entries(path)?;
-
-            if !quiet {
-                println!("{} entries in {}:", entries.len(), safe_archive_path);
-                println!();
-            }
-
-            let mut total_size = 0u64;
-            for entry in &entries {
-                let kind = match entry.kind {
-                    safe_unzip::EntryKind::File => "",
-                    safe_unzip::EntryKind::Directory => "/",
-                    safe_unzip::EntryKind::Symlink { .. } => " -> [symlink]",
-                };
-                println!(
-                    "{:>10}  {}{}",
-                    format_bytes(entry.size),
-                    sanitize_for_terminal(&entry.name),
-                    kind
-                );
-                total_size += entry.size;
-            }
-
-            if !quiet {
-                println!();
-                println!("Total: {} files, {}", entries.len(), format_bytes(total_size));
-            }
-        }
-        ArchiveFormat::Tar | ArchiveFormat::TarGz => {
-            let entries = if matches!(format, ArchiveFormat::TarGz) {
-                safe_unzip::list_tar_gz_entries(path)?
-            } else {
-                safe_unzip::list_tar_entries(path)?
-            };
-
-            if !quiet {
-                println!("{} entries in {}:", entries.len(), safe_archive_path);
-                println!();
-            }
-
-            let mut total_size = 0u64;
-            for entry in &entries {
-                let kind = match entry.kind {
-                    safe_unzip::EntryKind::File => "",
-                    safe_unzip::EntryKind::Directory => "/",
-                    safe_unzip::EntryKind::Symlink { .. } => " -> [symlink]",
-                };
-                println!(
-                    "{:>10}  {}{}",
-                    format_bytes(entry.size),
-                    sanitize_for_terminal(&entry.name),
-                    kind
-                );
-                total_size += entry.size;
-            }
-
-            if !quiet {
-                println!();
-                println!("Total: {} files, {}", entries.len(), format_bytes(total_size));
-            }
-        }
+    let entries = match format {
+        ArchiveFormat::Zip => safe_unzip::list_zip_entries_with_password(path, password)?,
+        ArchiveFormat::Tar => safe_unzip::list_tar_entries(path)?,
+        ArchiveFormat::TarGz => safe_unzip::list_tar_gz_entries(path)?,
         ArchiveFormat::SevenZ => {
             #[cfg(feature = "sevenz")]
             {
-                let adapter = safe_unzip::SevenZAdapter::open_with_password(path, password)?;
-                let entries = adapter.entries_metadata();
-
-                if !quiet {
-                    println!("{} entries in {}:", entries.len(), safe_archive_path);
-                    println!();
-                }
-
-                let mut total_size = 0u64;
-                for entry in &entries {
-                    let kind = match entry.kind {
-                        safe_unzip::EntryKind::File => "",
-                        safe_unzip::EntryKind::Directory => "/",
-                        safe_unzip::EntryKind::Symlink { .. } => " -> [symlink]",
-                    };
-                    println!(
-                        "{:>10}  {}{}",
-                        format_bytes(entry.size),
-                        sanitize_for_terminal(&entry.name),
-                        kind
-                    );
-                    total_size += entry.size;
-                }
-                if !quiet {
-                    println!();
-                    println!("Total: {} files, {}", entries.len(), format_bytes(total_size));
-                }
+                let adapter =
+                    safe_unzip::SevenZAdapter::open_with_limit(path, password, max_bytes)?;
+                adapter.entries_metadata()
             }
             #[cfg(not(feature = "sevenz"))]
             {
                 eprintln!("Error: 7z listing requires --features sevenz");
-                Err(Error::Io(std::io::Error::new(
+                return Err(Error::Io(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "7z not supported in this build",
-                )))
+                )));
             }
         }
-    }
+    };
+
+    print_entries(&entries, &safe_archive_path, quiet);
 
     Ok(())
 }
@@ -930,9 +1038,10 @@ fn verify_archive(
     format: ArchiveFormat,
     quiet: bool,
     password: Option<&str>,
+    max_bytes: u64,
 ) -> Result<(), Error> {
     #[cfg(not(feature = "sevenz"))]
-    let _ = password;
+    let _ = max_bytes;
 
     let safe_archive_path = sanitize_for_terminal(&path.to_string_lossy());
 
@@ -942,7 +1051,7 @@ fn verify_archive(
 
     match format {
         ArchiveFormat::Zip => {
-            let report = safe_unzip::verify_file(path)?;
+            let report = safe_unzip::verify_file_with_password(path, password)?;
 
             if !quiet {
                 println!(
@@ -960,31 +1069,37 @@ fn verify_archive(
                 safe_unzip::list_tar_entries(path)?
             };
 
-            let total_size: u64 = entries.iter().map(|e| e.size).sum();
-
             if !quiet {
-                println!("Verified {} entries ({})", entries.len(), format_bytes(total_size));
+                println!(
+                    "Verified {} entries ({})",
+                    entries.len(),
+                    format_bytes(total_entry_size(&entries))
+                );
             }
         }
         ArchiveFormat::SevenZ => {
             #[cfg(feature = "sevenz")]
             {
                 // SevenZAdapter decompresses fully on open, effectively verifying integrity
-                let adapter = safe_unzip::SevenZAdapter::open_with_password(path, password)?;
+                let adapter =
+                    safe_unzip::SevenZAdapter::open_with_limit(path, password, max_bytes)?;
                 let entries = adapter.entries_metadata();
-                let total_size: u64 = entries.iter().map(|e| e.size).sum();
 
                 if !quiet {
-                    println!("Verified {} entries ({})", entries.len(), format_bytes(total_size));
+                    println!(
+                        "Verified {} entries ({})",
+                        entries.len(),
+                        format_bytes(total_entry_size(&entries))
+                    );
                 }
             }
             #[cfg(not(feature = "sevenz"))]
             {
                 eprintln!("Error: 7z verification requires --features sevenz");
-                Err(Error::Io(std::io::Error::new(
+                return Err(Error::Io(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "7z not supported in this build",
-                )))
+                )));
             }
         }
     }
@@ -1046,6 +1161,7 @@ fn resolve_password(
     format: &ArchiveFormat,
     verbose: bool,
     config: &Config,
+    allow_prompt: bool,
 ) -> Option<String> {
     if !requires_password(archive, format) {
         return None;
@@ -1063,6 +1179,12 @@ fn resolve_password(
                 return Some(pwd.clone());
             }
         }
+    }
+
+    // stdin is the archive, so there is nothing left to read a password from
+    if !allow_prompt {
+        eprintln!("Archive is encrypted; pass --password (stdin is in use by the archive).");
+        return None;
     }
 
     // 2. Prompt user securely

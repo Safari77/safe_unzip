@@ -142,9 +142,17 @@ where
 /// # Ok::<(), safe_unzip::Error>(())
 /// ```
 pub fn verify_file<P: AsRef<std::path::Path>>(path: P) -> Result<VerifyReport, Error> {
+    verify_file_with_password(path, None)
+}
+
+/// Verify archive integrity, supplying a password for encrypted archives.
+pub fn verify_file_with_password<P: AsRef<std::path::Path>>(
+    path: P,
+    password: Option<&str>,
+) -> Result<VerifyReport, Error> {
     // We need a destination for Extractor, but verify doesn't use it
     let temp = std::env::temp_dir();
-    Extractor::new(&temp)?.verify_file(path)
+    Extractor::new(&temp)?.password(password.map(|p| p.as_bytes())).verify_file(path)
 }
 
 /// Verify archive integrity from bytes.
@@ -172,7 +180,19 @@ pub fn verify_bytes(data: &[u8]) -> Result<VerifyReport, Error> {
 pub fn list_zip_entries<P: AsRef<std::path::Path>>(
     path: P,
 ) -> Result<Vec<entry::EntryInfo>, Error> {
+    list_zip_entries_with_password(path, None)
+}
+
+/// List entries in a ZIP archive, supplying a password for encrypted archives.
+///
+/// Entry names are stored in cleartext, but listing an encrypted archive
+/// without a password is refused so callers do not mistake it for a plain one.
+pub fn list_zip_entries_with_password<P: AsRef<std::path::Path>>(
+    path: P,
+    password: Option<&str>,
+) -> Result<Vec<entry::EntryInfo>, Error> {
     let mut adapter = ZipAdapter::open(path)?;
+    adapter.password(password.map(|p| p.as_bytes()));
     adapter.entries_metadata()
 }
 
@@ -255,7 +275,7 @@ pub fn list_tar<R: std::io::Read>(reader: R) -> Result<Vec<entry::EntryInfo>, Er
             size: header.size()?,
             kind,
             mode: header.mode().ok(),
-            mtime: None,
+            mtime: header.mtime().ok(),
         });
     }
 

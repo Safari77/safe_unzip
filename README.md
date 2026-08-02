@@ -577,9 +577,9 @@ async def extract_all(archives):
 
 | Limit | Default | Description |
 |-------|---------|-------------|
-| `max_total_bytes` | 1 GB | Total uncompressed size |
-| `max_file_count` | 10,000 | Number of files |
-| `max_single_file` | 100 MB | Largest single file |
+| `max_total_bytes` | 4 GB | Total uncompressed size |
+| `max_file_count` | 100,000 | Number of files |
+| `max_single_file` | 4 GB | Largest single file |
 | `max_path_depth` | 50 | Directory nesting depth |
 
 ## Error Handling

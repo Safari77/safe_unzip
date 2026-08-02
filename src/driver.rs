@@ -199,18 +199,22 @@ impl Driver {
     ) -> Result<(), Error> {
         match info.kind {
             EntryKind::Directory => {
-                if state.created_dirs_cache.insert(safe_path.to_string()) {
+                // Directory entries carry a trailing '/', the parent of a file
+                // entry does not. Normalise so the same directory reached both
+                // ways shares one cache slot instead of being created (and
+                // counted) twice.
+                let key = safe_path.trim_end_matches('/');
+                if key.is_empty() {
+                    return Ok(());
+                }
+                if state.created_dirs_cache.insert(key.to_string()) {
                     if state.dirs_created >= self.limits.max_dir_count {
                         return Err(Error::DirCountExceeded {
                             limit: self.limits.max_dir_count,
                             attempted: state.dirs_created + 1,
                         });
                     }
-                    crate::entry::ensure_directory(
-                        &self.dir,
-                        safe_path,
-                        self.dir_mode.or(info.mode),
-                    )?;
+                    crate::entry::ensure_directory(&self.dir, key, self.dir_mode.or(info.mode))?;
                     state.dirs_created += 1;
                 }
             }
@@ -328,11 +332,18 @@ impl Driver {
     }
 
     /// Set entry filter.
+    ///
+    /// Filters compose: calling this repeatedly (directly, or through
+    /// [`Self::only`], [`Self::include_glob`] and [`Self::exclude_glob`]) keeps
+    /// every filter, and an entry is extracted only if all of them accept it.
     pub fn filter<F>(mut self, f: F) -> Self
     where
         F: Fn(&EntryInfo) -> bool + Send + Sync + 'static,
     {
-        self.filter = Some(Box::new(f));
+        self.filter = Some(match self.filter.take() {
+            Some(previous) => Box::new(move |entry: &EntryInfo| previous(entry) && f(entry)),
+            None => Box::new(f),
+        });
         self
     }
 
@@ -453,20 +464,37 @@ impl Driver {
     ) -> Result<(), Error> {
         let entries = adapter.entries_metadata()?;
         let mut state = ExtractionState::default();
+        let mut total_size: u64 = 0;
 
-        for info in entries {
-            policies.check_all(&info, &state)?;
-
-            // Update state for cumulative checks
-            if matches!(info.kind, EntryKind::File) {
-                state.bytes_written += info.size;
-                state.files_extracted += 1;
-            } else if matches!(info.kind, EntryKind::Directory)
-                && !self.junk_paths {
-                    state.dirs_created += 1;
+        for info in &entries {
+            // Apply filter during validation to match extraction behavior
+            if let Some(ref filter) = self.filter
+                && !filter(info) {
+                    continue; // Skip filtered entries during validation
                 }
-        }
 
+            // Skip symlinks when policy says to skip them
+            if matches!(info.kind, EntryKind::Symlink { .. })
+                && self.symlinks == SymlinkBehavior::Skip
+            {
+                continue;
+            }
+
+            policies.check_all(info, &state)?;
+
+            if matches!(info.kind, EntryKind::File) {
+                total_size = total_size.saturating_add(info.size);
+                if total_size > self.limits.max_total_bytes {
+                    return Err(Error::TotalSizeExceeded {
+                        limit: self.limits.max_total_bytes,
+                        would_be: total_size,
+                    });
+                }
+                state.files_extracted += 1;
+            } else if matches!(info.kind, EntryKind::Directory) && !self.junk_paths {
+                state.dirs_created += 1;
+            }
+        }
         Ok(())
     }
 
@@ -484,9 +512,10 @@ impl Driver {
 
         // Apply filters & skip rules
         if let Some(ref filter) = self.filter
-            && !filter(&info) {
-                skipped = true;
-            }
+            && !filter(&info)
+        {
+            skipped = true;
+        }
         if matches!(info.kind, EntryKind::Symlink { .. }) && self.symlinks == SymlinkBehavior::Skip
         {
             skipped = true;
@@ -501,9 +530,10 @@ impl Driver {
         if !skipped
             && matches!(info.kind, EntryKind::File)
             && matches!(self.overwrite, OverwriteMode::Skip)
-            && exists {
-                skipped = true;
-            }
+            && exists
+        {
+            skipped = true;
+        }
 
         let action = if skipped {
             EntryAction::Skipped
@@ -542,9 +572,12 @@ impl Driver {
                 return Ok(());
             };
 
-            let limit = self
-                .limits
-                .max_single_file
+            // Cap at the declared size too, so extract_to() can distinguish an
+            // entry that merely fills its budget from one that lies about its
+            // size and keeps producing data (a classic zip bomb).
+            let limit = info
+                .size
+                .min(self.limits.max_single_file)
                 .min(self.limits.max_total_bytes.saturating_sub(state.bytes_written));
             let (_, written) = adapter.extract_to(index, &mut outfile, limit)?;
 
@@ -553,7 +586,7 @@ impl Driver {
             if actual_path != safe_path {
                 state.renames.push((safe_path, actual_path));
             }
-            state.bytes_written += written;
+            state.bytes_written = state.bytes_written.saturating_add(written);
             state.files_extracted += 1;
         }
 
@@ -582,23 +615,25 @@ impl Driver {
 
         // ValidateFirst mode: cache all entries, validate, then extract
         if self.validation == ValidationMode::ValidateFirst {
-            let entries = adapter.cache_all()?;
+            let entries = adapter
+                .cache_all_limited(self.limits.max_single_file, self.limits.max_total_bytes)?;
             let total_entries = entries.len();
-            let mut state = ExtractionState::default();
 
-            // Validate all entries
+            // Validate all entries. This pass needs its own counters: carrying
+            // them into the extraction pass below would report (and charge
+            // against the limits) every entry twice.
+            let mut validation_state = ExtractionState::default();
             for info in &entries {
-                policies.check_all(info, &state)?;
+                policies.check_all(info, &validation_state)?;
                 if matches!(info.kind, EntryKind::File) {
-                    state.bytes_written += info.size;
-                    state.files_extracted += 1;
-                } else if matches!(info.kind, EntryKind::Directory)
-                    && !self.junk_paths {
-                        state.dirs_created += 1;
-                    }
+                    validation_state.bytes_written =
+                        validation_state.bytes_written.saturating_add(info.size);
+                    validation_state.files_extracted += 1;
+                } else if matches!(info.kind, EntryKind::Directory) && !self.junk_paths {
+                    validation_state.dirs_created += 1;
+                }
             }
 
-            // Extract from cache
             let mut state = ExtractionState::default();
             let mut entry_index = 0;
 
@@ -657,9 +692,10 @@ impl Driver {
         let mut skipped = false;
 
         if let Some(ref filter) = self.filter
-            && !filter(info) {
-                skipped = true;
-            }
+            && !filter(info)
+        {
+            skipped = true;
+        }
         if matches!(info.kind, EntryKind::Symlink { .. }) && self.symlinks == SymlinkBehavior::Skip
         {
             skipped = true;
@@ -674,9 +710,10 @@ impl Driver {
         if !skipped
             && matches!(info.kind, EntryKind::File)
             && matches!(self.overwrite, OverwriteMode::Skip)
-            && exists {
-                skipped = true;
-            }
+            && exists
+        {
+            skipped = true;
+        }
 
         let action = if skipped {
             EntryAction::Skipped
@@ -715,12 +752,27 @@ impl Driver {
             };
 
             if let Some(reader) = reader {
-                let limit = self
+                // The header length is authoritative for TAR, but still clamp to
+                // the configured limits in case the policies were relaxed.
+                let budget = self
                     .limits
                     .max_single_file
                     .min(self.limits.max_total_bytes.saturating_sub(state.bytes_written));
+                let limit = info.size.min(budget);
                 let written = crate::adapter::copy_limited(reader, &mut outfile, limit)?;
-                state.bytes_written += written;
+                state.bytes_written = state.bytes_written.saturating_add(written);
+
+                // A short read means the archive is truncated or the limits cut
+                // the entry off; either way the file on disk is incomplete.
+                if written < info.size {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "entry '{}' ended after {} of {} declared bytes",
+                            info.name, written, info.size
+                        ),
+                    )));
+                }
             }
 
             self.finalize_file(outfile, info)?;
@@ -748,9 +800,10 @@ impl Driver {
         let mut skipped = false;
 
         if let Some(ref filter) = self.filter
-            && !filter(info) {
-                skipped = true;
-            }
+            && !filter(info)
+        {
+            skipped = true;
+        }
         if matches!(info.kind, EntryKind::Symlink { .. }) && self.symlinks == SymlinkBehavior::Skip
         {
             skipped = true;
@@ -765,9 +818,10 @@ impl Driver {
         if !skipped
             && matches!(info.kind, EntryKind::File)
             && matches!(self.overwrite, OverwriteMode::Skip)
-            && exists {
-                skipped = true;
-            }
+            && exists
+        {
+            skipped = true;
+        }
 
         let action = if skipped {
             EntryAction::Skipped
@@ -928,9 +982,10 @@ impl Driver {
         let mut skipped = false;
 
         if let Some(ref filter) = self.filter
-            && !filter(info) {
-                skipped = true;
-            }
+            && !filter(info)
+        {
+            skipped = true;
+        }
         if matches!(info.kind, EntryKind::Symlink { .. }) && self.symlinks == SymlinkBehavior::Skip
         {
             skipped = true;
@@ -945,9 +1000,10 @@ impl Driver {
         if !skipped
             && matches!(info.kind, EntryKind::File)
             && matches!(self.overwrite, OverwriteMode::Skip)
-            && exists {
-                skipped = true;
-            }
+            && exists
+        {
+            skipped = true;
+        }
 
         let action = if skipped {
             EntryAction::Skipped
@@ -1005,14 +1061,22 @@ impl Driver {
     /// Convenience: extract 7z from a file path.
     #[cfg(feature = "sevenz")]
     pub fn extract_7z_file<P: AsRef<Path>>(&self, path: P) -> Result<ExtractionReport, Error> {
-        let adapter = crate::adapter::SevenZAdapter::open(path)?;
+        let adapter = crate::adapter::SevenZAdapter::open_with_limit(
+            path,
+            None,
+            self.limits.max_total_bytes,
+        )?;
         self.extract_7z(adapter)
     }
 
     /// Convenience: extract 7z from bytes.
     #[cfg(feature = "sevenz")]
     pub fn extract_7z_bytes(&self, data: &[u8]) -> Result<ExtractionReport, Error> {
-        let adapter = crate::adapter::SevenZAdapter::from_bytes(data)?;
+        let adapter = crate::adapter::SevenZAdapter::from_bytes_with_limit(
+            data,
+            None,
+            self.limits.max_total_bytes,
+        )?;
         self.extract_7z(adapter)
     }
 }

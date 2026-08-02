@@ -1,15 +1,15 @@
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
-    /// Maximum total bytes to extract. Default: 1 GB.
+    /// Maximum total bytes to extract. Default: 4 GB.
     pub max_total_bytes: u64,
 
-    /// Maximum number of files to extract. Default: 10,000.
+    /// Maximum number of files to extract. Default: 100,000.
     pub max_file_count: usize,
 
     /// Maximum number of directories to extract/create. Default: 100,000.
     pub max_dir_count: usize,
 
-    /// Maximum size of a single file. Default: 100 MB.
+    /// Maximum size of a single file. Default: 4 GB.
     pub max_single_file: u64,
 
     /// Maximum directory depth. Default: 50.

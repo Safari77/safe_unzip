@@ -99,9 +99,15 @@ impl<'a> From<&Entry<'a>> for EntryInfo {
 /// preventing symlink TOC-TOU attacks.
 pub(crate) fn restore_file_times(file: std::fs::File, mtime: Option<u64>, name: &str) {
     if let Some(m) = mtime {
-        let st = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(m);
-        if let Err(e) = file.set_modified(st) {
-            eprintln!("Warning: Could not set timestamp for {}: {}", name, e);
+        match std::time::SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(m)) {
+            Some(st) => {
+                if let Err(e) = file.set_modified(st) {
+                    eprintln!("Warning: Could not set timestamp for {}: {}", name, e);
+                }
+            }
+            None => {
+                eprintln!("Warning: Timestamp {} is out of range for {}", m, name);
+            }
         }
     } else {
         eprintln!("Warning: No valid timestamp found in archive for {}", name);

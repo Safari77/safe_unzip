@@ -206,11 +206,9 @@ impl Policy for SizePolicy {
         }
 
         // Check total size limit
-        if state.bytes_written + entry.size > self.max_total {
-            return Err(Error::TotalSizeExceeded {
-                limit: self.max_total,
-                would_be: state.bytes_written + entry.size,
-            });
+        let would_be = state.bytes_written.saturating_add(entry.size);
+        if would_be > self.max_total {
+            return Err(Error::TotalSizeExceeded { limit: self.max_total, would_be });
         }
 
         Ok(())
@@ -245,13 +243,11 @@ impl Policy for CountPolicy {
                     attempted: state.dirs_created + 1,
                 });
             }
-        } else {
-            if state.files_extracted >= self.max_files {
-                return Err(Error::FileCountExceeded {
-                    limit: self.max_files,
-                    attempted: state.files_extracted + 1,
-                });
-            }
+        } else if state.files_extracted >= self.max_files {
+            return Err(Error::FileCountExceeded {
+                limit: self.max_files,
+                attempted: state.files_extracted + 1,
+            });
         }
         Ok(())
     }

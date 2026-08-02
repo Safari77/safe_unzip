@@ -105,8 +105,11 @@ fn test_tar_with_directory() {
     let report = Driver::new(dest.path()).unwrap().extract_tar(adapter).unwrap();
 
     assert_eq!(report.files_extracted, 1);
-    // "subdir" and "subdir/" are different strings in the directory cache
-    assert_eq!(report.dirs_created, 2);
+    // Entry order doesn't change the count either way now, but it does still affect permissions:
+    // ensure_directory only applies dir_mode/info.mode to directories it actually creates. If a
+    // file entry precedes its own directory entry in the archive, the directory gets created as
+    // the file's parent with dir_mode only (not the archive's stored mode)
+    assert_eq!(report.dirs_created, 1);
     assert!(dest.path().join("subdir/file.txt").exists());
 
     println!("✅ TAR with directory works");

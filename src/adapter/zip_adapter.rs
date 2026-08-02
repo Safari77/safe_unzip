@@ -42,7 +42,8 @@ impl<R: Read + Seek> ZipAdapter<R> {
     ///
     /// # Errors
     ///
-    /// Returns `Error::EncryptedEntry` if any entry is encrypted.
+    /// Returns `Error::EncryptedEntry` if any entry is encrypted and no
+    /// password was set via [`Self::password`].
     pub fn entries_metadata(&mut self) -> Result<Vec<EntryInfo>, Error> {
         let mut entries = Vec::with_capacity(self.archive.len());
 
@@ -50,8 +51,8 @@ impl<R: Read + Seek> ZipAdapter<R> {
             let entry = self.archive.by_index_raw(i)?;
             let name = entry.name().to_string();
 
-            // Reject encrypted entries
-            if entry.encrypted() {
+            // Reject encrypted entries we have no way of reading
+            if entry.encrypted() && self.password.is_none() {
                 return Err(Error::EncryptedEntry { entry: name });
             }
 
@@ -90,7 +91,8 @@ impl<R: Read + Seek> ZipAdapter<R> {
     ///
     /// # Errors
     ///
-    /// Returns `Error::EncryptedEntry` if any entry is encrypted.
+    /// Returns `Error::EncryptedEntry` if any entry is encrypted and no
+    /// password was set via [`Self::password`].
     pub fn for_each<F>(&mut self, mut callback: F) -> Result<(), Error>
     where
         F: FnMut(EntryInfo, Option<&mut dyn Read>) -> Result<bool, Error>,
@@ -102,8 +104,8 @@ impl<R: Read + Seek> ZipAdapter<R> {
             };
             let name = entry.name().to_string();
 
-            // Reject encrypted entries
-            if entry.encrypted() {
+            // Reject encrypted entries we have no way of reading
+            if entry.encrypted() && self.password.is_none() {
                 return Err(Error::EncryptedEntry { entry: name });
             }
 
@@ -185,7 +187,20 @@ impl<R: Read + Seek> ZipAdapter<R> {
         };
 
         let bytes_written = if matches!(kind, EntryKind::File) {
-            copy_limited(&mut entry, writer, limit)?
+            let written = crate::adapter::copy_limited(&mut entry, writer, limit)?;
+
+            // SECURITY: a zip bomb can declare a tiny uncompressed size and then
+            // expand to gigabytes. copy_limited() stops at the limit, so probe
+            // for leftover data rather than silently writing a truncated file.
+            if written == limit && crate::adapter::has_more_data(&mut entry)? {
+                return Err(Error::SizeMismatch {
+                    entry: info.name.clone(),
+                    declared: info.size,
+                    actual: written.saturating_add(1),
+                });
+            }
+
+            written
         } else {
             0
         };
@@ -197,13 +212,14 @@ impl<R: Read + Seek> ZipAdapter<R> {
     ///
     /// # Errors
     ///
-    /// Returns `Error::EncryptedEntry` if the entry is encrypted.
+    /// Returns `Error::EncryptedEntry` if the entry is encrypted and no
+    /// password was set via [`Self::password`].
     pub fn entry_info(&mut self, index: usize) -> Result<EntryInfo, Error> {
         let entry = self.archive.by_index_raw(index)?;
         let name = entry.name().to_string();
 
-        // Reject encrypted entries
-        if entry.encrypted() {
+        // Reject encrypted entries we have no way of reading
+        if entry.encrypted() && self.password.is_none() {
             return Err(Error::EncryptedEntry { entry: name });
         }
 
@@ -234,34 +250,6 @@ impl ZipAdapter<BufReader<File>> {
     }
 }
 
-/// Copy with a byte limit, returning bytes written.
-fn copy_limited<R: Read, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    limit: u64,
-) -> Result<u64, Error> {
-    let mut total = 0u64;
-    let mut buf = [0u8; 8192];
-
-    loop {
-        let remaining = limit.saturating_sub(total);
-        if remaining == 0 {
-            break;
-        }
-
-        let to_read = buf.len().min(remaining as usize);
-        let n = reader.read(&mut buf[..to_read])?;
-        if n == 0 {
-            break;
-        }
-
-        writer.write_all(&buf[..n])?;
-        total += n as u64;
-    }
-
-    Ok(total)
-}
-
 /// Helper to safely convert zip::DateTime to a Unix timestamp.
 /// MS-DOS times are often invalid (e.g. day 0, second 60). We clamp
 /// and sanitize them to ensure `chrono` doesn't reject the date.
@@ -283,5 +271,7 @@ pub(crate) fn zip_time_to_timestamp(dt: Option<zip::DateTime>) -> Option<u64> {
 
     let time = chrono::NaiveTime::from_hms_opt(hour, minute, second).unwrap_or_default();
 
-    Some(chrono::NaiveDateTime::new(date, time).and_utc().timestamp() as u64)
+    // Dates before the Unix epoch give a negative timestamp; casting that to u64
+    // wraps into the far future and blows up SystemTime arithmetic later.
+    u64::try_from(chrono::NaiveDateTime::new(date, time).and_utc().timestamp()).ok()
 }

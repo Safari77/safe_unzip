@@ -48,8 +48,21 @@ impl SevenZAdapter {
         path: P,
         password: Option<&str>,
     ) -> Result<Self, Error> {
+        Self::open_with_limit(path, password, u64::MAX)
+    }
+
+    /// Open a 7z file from a path, refusing to buffer more than
+    /// `max_total_bytes` of decompressed content.
+    ///
+    /// 7z entries are decompressed up front, so without a cap a small archive
+    /// can exhaust memory long before the policy chain ever sees it.
+    pub fn open_with_limit<P: AsRef<Path>>(
+        path: P,
+        password: Option<&str>,
+        max_total_bytes: u64,
+    ) -> Result<Self, Error> {
         let path = path.as_ref();
-        let entries = Self::decompress_all(path, password)?;
+        let entries = Self::decompress_all(path, password, max_total_bytes)?;
         Ok(Self { entries })
     }
 
@@ -60,15 +73,30 @@ impl SevenZAdapter {
 
     /// Open a 7z file from bytes, decrypting with `password`.
     pub fn from_bytes_with_password(data: &[u8], password: Option<&str>) -> Result<Self, Error> {
+        Self::from_bytes_with_limit(data, password, u64::MAX)
+    }
+
+    /// Open a 7z file from bytes with a cap on decompressed size.
+    pub fn from_bytes_with_limit(
+        data: &[u8],
+        password: Option<&str>,
+        max_total_bytes: u64,
+    ) -> Result<Self, Error> {
         // sevenz-rust requires a file path, so we write to a temp file
         let mut temp = tempfile::NamedTempFile::new()?;
         temp.write_all(data)?;
         temp.flush()?;
-        Self::open_with_password(temp.path(), password)
+        Self::open_with_limit(temp.path(), password, max_total_bytes)
     }
 
-    fn decompress_all(path: &Path, password: Option<&str>) -> Result<Vec<SevenZEntry>, Error> {
+    fn decompress_all(
+        path: &Path,
+        password: Option<&str>,
+        max_total_bytes: u64,
+    ) -> Result<Vec<SevenZEntry>, Error> {
         let mut entries = Vec::new();
+        let mut total_bytes: u64 = 0;
+        let mut limit_hit = false;
 
         // Password::from(&str) does the UTF-16LE encoding that 7zAES expects
         let password = match password {
@@ -89,10 +117,26 @@ impl SevenZAdapter {
                 let kind =
                     if entry.is_directory() { EntryKind::Directory } else { EntryKind::File };
 
-                // Read content for files
+                // Read content for files, stopping one byte past the remaining
+                // budget so an over-sized archive is detected rather than buffered
                 let mut data = Vec::new();
                 if matches!(kind, EntryKind::File) {
-                    reader.read_to_end(&mut data)?;
+                    let budget = max_total_bytes.saturating_sub(total_bytes).saturating_add(1);
+                    let mut buf = [0u8; 8192];
+                    while (data.len() as u64) < budget {
+                        let want = (budget - data.len() as u64).min(buf.len() as u64) as usize;
+                        let n = reader.read(&mut buf[..want])?;
+                        if n == 0 {
+                            break;
+                        }
+                        data.extend_from_slice(&buf[..n]);
+                    }
+
+                    total_bytes = total_bytes.saturating_add(data.len() as u64);
+                    if total_bytes > max_total_bytes {
+                        limit_hit = true;
+                        return Ok(false);
+                    }
                 }
 
                 let info = EntryInfo {
@@ -107,6 +151,10 @@ impl SevenZAdapter {
                 Ok(true)
             })
             .map_err(|e| map_7z_error("read", e))?;
+
+        if limit_hit {
+            return Err(Error::TotalSizeExceeded { limit: max_total_bytes, would_be: total_bytes });
+        }
 
         Ok(entries)
     }

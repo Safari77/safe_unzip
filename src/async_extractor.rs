@@ -267,6 +267,7 @@ fn extraction_report_to_report(report: ExtractionReport) -> Report {
         dirs_created: report.dirs_created,
         bytes_written: report.bytes_written,
         entries_skipped: report.entries_skipped,
+        renames: report.renames,
     }
 }
 
@@ -277,6 +278,8 @@ fn convert_overwrite_policy(policy: OverwritePolicy) -> OverwriteMode {
         OverwritePolicy::Error => OverwriteMode::Error,
         OverwritePolicy::Skip => OverwriteMode::Skip,
         OverwritePolicy::Overwrite => OverwriteMode::Overwrite,
+        OverwritePolicy::RenameBase => OverwriteMode::RenameBase,
+        OverwritePolicy::RenameExt => OverwriteMode::RenameExt,
     }
 }
 

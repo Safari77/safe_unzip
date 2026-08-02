@@ -23,7 +23,7 @@ pub enum OverwritePolicy {
     Skip,
     /// Overwrite existing files. Symlinks are removed before overwriting (security).
     Overwrite,
-    /// Rename file.ext to file.1.ext
+    /// Rename file.ext to file_1.ext
     RenameBase,
     /// Rename file.ext to file.ext.1
     RenameExt,
@@ -289,11 +289,19 @@ impl Extractor {
         self
     }
 
+    /// Set an entry filter.
+    ///
+    /// Filters compose: calling this repeatedly (directly, or through
+    /// [`Self::only`], [`Self::include_glob`] and [`Self::exclude_glob`]) keeps
+    /// every filter, and an entry is extracted only if all of them accept it.
     pub fn filter<F>(mut self, f: F) -> Self
     where
         F: Fn(&EntryInfo) -> bool + Send + Sync + 'static,
     {
-        self.filter = Some(Box::new(f));
+        self.filter = Some(match self.filter.take() {
+            Some(previous) => Box::new(move |entry: &EntryInfo| previous(entry) && f(entry)),
+            None => Box::new(f),
+        });
         self
     }
 
@@ -422,6 +430,31 @@ impl Extractor {
                 return Err(Error::InvalidFilename { entry: name, reason: reason.to_string() });
             }
 
+            // 0.5 SECURITY: Zip Slip. cap-std refuses to follow an escaping path
+            // anyway, but that arrives as an opaque I/O error, so reject it here
+            // to report Error::PathEscape naming the offending entry. This
+            // mirrors validate_all(), which only runs in ValidateFirst mode.
+            // With junk_paths only the file name survives, so it cannot escape.
+            if !self.junk_paths {
+                for comp in Path::new(&name).components() {
+                    match comp {
+                        Component::ParentDir => {
+                            return Err(Error::PathEscape {
+                                entry: name.clone(),
+                                detail: "Contains parent directory (..) component".to_string(),
+                            });
+                        }
+                        Component::RootDir | Component::Prefix(_) => {
+                            return Err(Error::PathEscape {
+                                entry: name.clone(),
+                                detail: "Contains absolute path component".to_string(),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             // 1. Modified Path Resolution
             let safe_relative_path = if self.junk_paths {
                 Path::new(&name)
@@ -469,18 +502,22 @@ impl Extractor {
             // 3. CHECK: Filter (User Logic)
             if !skipped
                 && let Some(ref filter) = self.filter
-                    && !filter(&info) {
-                        skipped = true;
-                    }
+                && !filter(&info)
+            {
+                skipped = true;
+            }
 
             // Check if file already exists
             let exists = self.dir.symlink_metadata(&safe_relative_path).is_ok();
 
             // 3.5 CHECK: Existing file for OverwritePolicy::Skip
-            if !skipped && !entry.is_dir() && matches!(self.overwrite, OverwritePolicy::Skip)
-                && exists {
-                    skipped = true;
-                }
+            if !skipped
+                && !entry.is_dir()
+                && matches!(self.overwrite, OverwritePolicy::Skip)
+                && exists
+            {
+                skipped = true;
+            }
 
             let action = if skipped {
                 EntryAction::Skipped
@@ -549,16 +586,21 @@ impl Extractor {
             }
 
             // Check total size (Lookahead declared)
-            if total_bytes_written + entry.size() > self.limits.max_total_bytes {
+            let would_be = total_bytes_written.saturating_add(entry.size());
+            if would_be > self.limits.max_total_bytes {
                 return Err(Error::TotalSizeExceeded {
                     limit: self.limits.max_total_bytes,
-                    would_be: total_bytes_written + entry.size(),
+                    would_be,
                 });
             }
 
             // 7. EXECUTION
             if entry.is_dir() {
-                if created_dirs.insert(safe_relative_path.clone()) {
+                // Directory entries carry a trailing '/', the parent path of a
+                // file entry does not. Normalise so the same directory reached
+                // both ways is created (and counted) only once.
+                let dir_key = safe_relative_path.trim_end_matches('/').to_string();
+                if !dir_key.is_empty() && created_dirs.insert(dir_key.clone()) {
                     if report.dirs_created >= self.limits.max_dir_count {
                         return Err(Error::DirCountExceeded {
                             limit: self.limits.max_dir_count,
@@ -567,7 +609,7 @@ impl Extractor {
                     }
                     crate::entry::ensure_directory(
                         &self.dir,
-                        &safe_relative_path,
+                        &dir_key,
                         self.dir_mode.or_else(|| entry.unix_mode()),
                     )?;
                     report.dirs_created += 1;
@@ -847,7 +889,7 @@ impl Extractor {
                     }
                 }
             } else if !entry.is_symlink() {
-                total_size += entry.size();
+                total_size = total_size.saturating_add(entry.size());
                 file_count += 1;
 
                 if total_size > self.limits.max_total_bytes {
@@ -909,7 +951,10 @@ impl Extractor {
         let mut bytes_verified = 0u64;
 
         for i in 0..archive.len() {
-            let mut entry = archive.by_index(i)?;
+            let mut entry = match &self.password {
+                Some(pwd) => archive.by_index_decrypt(i, pwd)?,
+                None => archive.by_index(i)?,
+            };
             let name = entry.name().to_string();
 
             if entry.encrypted() && self.password.is_none() {
