@@ -49,7 +49,7 @@ impl<R: Read + Seek> ZipAdapter<R> {
 
         for i in 0..self.archive.len() {
             let entry = self.archive.by_index_raw(i)?;
-            let name = entry.name().to_string();
+            let name = entry.name()?.into_owned();
 
             // Reject encrypted entries we have no way of reading
             if entry.encrypted() && self.password.is_none() {
@@ -102,7 +102,7 @@ impl<R: Read + Seek> ZipAdapter<R> {
                 Some(pwd) => self.archive.by_index_decrypt(i, pwd)?,
                 None => self.archive.by_index(i)?,
             };
-            let name = entry.name().to_string();
+            let name = entry.name()?.into_owned();
 
             // Reject encrypted entries we have no way of reading
             if entry.encrypted() && self.password.is_none() {
@@ -161,7 +161,7 @@ impl<R: Read + Seek> ZipAdapter<R> {
             None => self.archive.by_index(index)?,
         };
 
-        let name = entry.name().to_string();
+        let name = entry.name()?.into_owned();
 
         // Reject encrypted entries
         if entry.encrypted() && self.password.is_none() {
@@ -216,7 +216,7 @@ impl<R: Read + Seek> ZipAdapter<R> {
     /// password was set via [`Self::password`].
     pub fn entry_info(&mut self, index: usize) -> Result<EntryInfo, Error> {
         let entry = self.archive.by_index_raw(index)?;
-        let name = entry.name().to_string();
+        let name = entry.name()?.into_owned();
 
         // Reject encrypted entries we have no way of reading
         if entry.encrypted() && self.password.is_none() {

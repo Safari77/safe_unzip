@@ -423,7 +423,7 @@ impl Extractor {
                 Some(pwd) => archive.by_index_decrypt(i, pwd)?,
                 None => archive.by_index(i)?,
             };
-            let name = entry.name().to_string();
+            let name = entry.name()?.into_owned();
 
             // 0. SECURITY: Filename Sanitization
             if let Err(reason) = self.validate_filename(&name) {
@@ -831,7 +831,7 @@ impl Extractor {
         for i in 0..archive.len() {
             // by_index_raw reads metadata WITHOUT decompressing
             let entry = archive.by_index_raw(i)?;
-            let name = entry.name().to_string();
+            let name = entry.name()?.into_owned();
 
             // 0. Filename sanitization
             if let Err(reason) = self.validate_filename(&name) {
@@ -955,7 +955,7 @@ impl Extractor {
                 Some(pwd) => archive.by_index_decrypt(i, pwd)?,
                 None => archive.by_index(i)?,
             };
-            let name = entry.name().to_string();
+            let name = entry.name()?.into_owned();
 
             if entry.encrypted() && self.password.is_none() {
                 return Err(Error::EncryptedEntry { entry: name });
