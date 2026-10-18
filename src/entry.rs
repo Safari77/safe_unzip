@@ -15,6 +15,8 @@ pub enum EntryKind {
     Directory,
     /// A symbolic link pointing to a target path.
     Symlink { target: String },
+    /// A hard link pointing to another entry in the archive.
+    Hardlink { target: String },
 }
 
 /// A single entry in an archive.
@@ -52,6 +54,11 @@ impl<'a> Entry<'a> {
         matches!(self.kind, EntryKind::Symlink { .. })
     }
 
+    /// Returns true if this entry is a hard link.
+    pub fn is_hardlink(&self) -> bool {
+        matches!(self.kind, EntryKind::Hardlink { .. })
+    }
+
     /// Returns the symlink target if this is a symlink.
     pub fn symlink_target(&self) -> Option<&str> {
         match &self.kind {
@@ -60,9 +67,20 @@ impl<'a> Entry<'a> {
         }
     }
 
-    /// Returns the depth of the entry path (number of components).
+    /// Returns the hard link target if this is a hard link.
+    pub fn hardlink_target(&self) -> Option<&str> {
+        match &self.kind {
+            EntryKind::Hardlink { target } => Some(target),
+            _ => None,
+        }
+    }
+
+    /// Returns the depth of the entry path (number of normal components).
     pub fn depth(&self) -> usize {
-        Path::new(&self.name).components().count()
+        Path::new(&self.name)
+            .components()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+            .count()
     }
 }
 
@@ -97,53 +115,65 @@ impl<'a> From<&Entry<'a>> for EntryInfo {
 
 /// Securely applies the modified time to an open file descriptor,
 /// preventing symlink TOC-TOU attacks.
-pub(crate) fn restore_file_times(file: std::fs::File, mtime: Option<u64>, name: &str) {
-    if let Some(m) = mtime {
-        match std::time::SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(m)) {
-            Some(st) => {
-                if let Err(e) = file.set_modified(st) {
-                    eprintln!("Warning: Could not set timestamp for {}: {}", name, e);
-                }
-            }
-            None => {
-                eprintln!("Warning: Timestamp {} is out of range for {}", m, name);
-            }
-        }
-    } else {
-        eprintln!("Warning: No valid timestamp found in archive for {}", name);
+pub(crate) fn restore_file_times(file: std::fs::File, mtime: Option<u64>, _name: &str) {
+    if let Some(m) = mtime
+        && let Some(st) =
+            std::time::SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(m))
+    {
+        let _ = file.set_modified(st);
     }
     // `file` drops here, securely closing the file descriptor.
 }
 
-/// Securely creates a directory path using cap_std and applies dir_mode to each newly created component.
+/// Securely creates a directory path using cap_std, enforces directory count limits,
+/// and applies dir_mode to each newly created component.
 pub(crate) fn ensure_directory(
     dir: &cap_std::fs_utf8::Dir,
     path: &str,
     dir_mode: Option<u32>,
+    created_dirs: &mut std::collections::HashSet<String>,
+    dirs_created: &mut usize,
+    max_dir_count: usize,
 ) -> Result<(), crate::error::Error> {
     let utf8_path = camino::Utf8Path::new(path);
     let mut current = camino::Utf8PathBuf::new();
 
     for component in utf8_path.components() {
+        if !matches!(component, camino::Utf8Component::Normal(_)) {
+            continue;
+        }
         current.push(component);
-        if current.as_str().is_empty() || current.as_str() == "/" {
+        let current_str = current.as_str();
+        if current_str.is_empty() || current_str == "/" {
             continue;
         }
 
-        match dir.create_dir(&current) {
-            Ok(()) => {
-                #[cfg(unix)]
-                if let Some(mode) = dir_mode {
-                    // Scope cap_std's PermissionsExt trait locally
-                    use cap_std::fs::PermissionsExt;
-                    let safe_mode = mode & 0o0777;
-                    // Ignore errors here, as cap-std will block unsafe traversal anyway
-                    let _ = dir
-                        .set_permissions(&current, cap_std::fs::Permissions::from_mode(safe_mode));
-                }
+        if created_dirs.insert(current_str.to_string()) {
+            if *dirs_created >= max_dir_count {
+                return Err(crate::error::Error::DirCountExceeded {
+                    limit: max_dir_count,
+                    attempted: *dirs_created + 1,
+                });
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e.into()),
+
+            match dir.create_dir(&current) {
+                Ok(()) => {
+                    *dirs_created += 1;
+                    #[cfg(unix)]
+                    if let Some(mode) = dir_mode {
+                        // Scope cap_std's PermissionsExt trait locally
+                        use cap_std::fs::PermissionsExt;
+                        let safe_mode = mode & 0o0777;
+                        // Ignore errors here, as cap-std will block unsafe traversal anyway
+                        let _ = dir.set_permissions(
+                            &current,
+                            cap_std::fs::Permissions::from_mode(safe_mode),
+                        );
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.into()),
+            }
         }
     }
     Ok(())

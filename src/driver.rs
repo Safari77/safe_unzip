@@ -116,6 +116,20 @@ impl Driver {
         Self::new_impl(destination.as_ref(), true)
     }
 
+    /// Generates a renamed path for index `i` based on the configured overwrite mode.
+    fn compute_renamed_path(&self, path: &str, i: usize) -> String {
+        let utf8_path = camino::Utf8Path::new(path);
+        let parent = utf8_path.parent().unwrap_or(camino::Utf8Path::new(""));
+        let new_name = if matches!(self.overwrite, OverwriteMode::RenameExt) {
+            format!("{}.{}", utf8_path.file_name().unwrap_or("file"), i)
+        } else if let Some(ext) = utf8_path.extension() {
+            format!("{}_{}.{}", utf8_path.file_stem().unwrap_or("file"), i, ext)
+        } else {
+            format!("{}_{}", utf8_path.file_name().unwrap_or("file"), i)
+        };
+        if parent.as_str().is_empty() { new_name } else { parent.join(new_name).into_string() }
+    }
+
     /// Handles file creation for RenameBase and RenameExt policies.
     fn open_with_rename(&self, path: &str) -> Result<(cap_std::fs_utf8::File, String), Error> {
         let mut i = 1;
@@ -132,25 +146,63 @@ impl Driver {
                 Ok(f) => return Ok((f, current_path)),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Always base the new name on the original path
-                    let utf8_path = camino::Utf8Path::new(path);
-                    let parent = utf8_path.parent().unwrap_or(camino::Utf8Path::new(""));
-                    let new_name = if matches!(self.overwrite, OverwriteMode::RenameExt) {
-                        format!("{}.{}", utf8_path.file_name().unwrap_or("file"), i)
-                    } else {
-                        if let Some(ext) = utf8_path.extension() {
-                            format!("{}_{}.{}", utf8_path.file_stem().unwrap(), i, ext)
-                        } else {
-                            format!("{}_{}", utf8_path.file_name().unwrap_or("file"), i)
-                        }
-                    };
-                    current_path = if parent.as_str().is_empty() {
-                        new_name
-                    } else {
-                        parent.join(new_name).into_string()
-                    };
+                    current_path = self.compute_renamed_path(path, i);
                     i += 1;
                 }
                 Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Handles hard link creation across all OverwriteMode variants, including RenameBase and RenameExt.
+    fn create_hard_link(
+        &self,
+        safe_target: &str,
+        safe_path: &str,
+        state: &mut ExtractionState,
+    ) -> Result<Option<String>, Error> {
+        match self.overwrite {
+            OverwriteMode::Error => match self.dir.hard_link(safe_target, &self.dir, safe_path) {
+                Ok(()) => Ok(Some(safe_path.to_string())),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Err(Error::AlreadyExists { entry: safe_path.to_string() })
+                }
+                Err(e) => Err(e.into()),
+            },
+            OverwriteMode::Skip => match self.dir.hard_link(safe_target, &self.dir, safe_path) {
+                Ok(()) => Ok(Some(safe_path.to_string())),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    state.entries_skipped += 1;
+                    Ok(None)
+                }
+                Err(e) => Err(e.into()),
+            },
+            OverwriteMode::Overwrite => {
+                if self.dir.symlink_metadata(safe_path).is_ok() {
+                    let _ = self.dir.remove_file(safe_path);
+                }
+                self.dir.hard_link(safe_target, &self.dir, safe_path)?;
+                Ok(Some(safe_path.to_string()))
+            }
+            OverwriteMode::RenameBase | OverwriteMode::RenameExt => {
+                let mut i = 1;
+                let mut current_path = safe_path.to_string();
+                loop {
+                    if i > self.limits.max_renames {
+                        return Err(Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            "Too many rename attempts for file",
+                        )));
+                    }
+                    match self.dir.hard_link(safe_target, &self.dir, &current_path) {
+                        Ok(()) => return Ok(Some(current_path)),
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                            current_path = self.compute_renamed_path(safe_path, i);
+                            i += 1;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
             }
         }
     }
@@ -199,41 +251,32 @@ impl Driver {
     ) -> Result<(), Error> {
         match info.kind {
             EntryKind::Directory => {
-                // Directory entries carry a trailing '/', the parent of a file
-                // entry does not. Normalise so the same directory reached both
-                // ways shares one cache slot instead of being created (and
-                // counted) twice.
                 let key = safe_path.trim_end_matches('/');
                 if key.is_empty() {
                     return Ok(());
                 }
-                if state.created_dirs_cache.insert(key.to_string()) {
-                    if state.dirs_created >= self.limits.max_dir_count {
-                        return Err(Error::DirCountExceeded {
-                            limit: self.limits.max_dir_count,
-                            attempted: state.dirs_created + 1,
-                        });
-                    }
-                    crate::entry::ensure_directory(&self.dir, key, self.dir_mode.or(info.mode))?;
-                    state.dirs_created += 1;
-                }
+                crate::entry::ensure_directory(
+                    &self.dir,
+                    key,
+                    self.dir_mode.or(info.mode),
+                    &mut state.created_dirs_cache,
+                    &mut state.dirs_created,
+                    self.limits.max_dir_count,
+                )?;
             }
-            EntryKind::File => {
+            EntryKind::File | EntryKind::Hardlink { .. } => {
                 if !self.junk_paths
                     && let Some(parent) = camino::Utf8Path::new(safe_path).parent()
                     && !parent.as_str().is_empty()
                 {
-                    let parent_str = parent.as_str();
-                    if state.created_dirs_cache.insert(parent_str.to_string()) {
-                        if state.dirs_created >= self.limits.max_dir_count {
-                            return Err(Error::DirCountExceeded {
-                                limit: self.limits.max_dir_count,
-                                attempted: state.dirs_created + 1,
-                            });
-                        }
-                        crate::entry::ensure_directory(&self.dir, parent_str, self.dir_mode)?;
-                        state.dirs_created += 1;
-                    }
+                    crate::entry::ensure_directory(
+                        &self.dir,
+                        parent.as_str(),
+                        self.dir_mode,
+                        &mut state.created_dirs_cache,
+                        &mut state.dirs_created,
+                        self.limits.max_dir_count,
+                    )?;
                 }
             }
             EntryKind::Symlink { .. } => {}
@@ -347,10 +390,21 @@ impl Driver {
         self
     }
 
-    // Resolves path explicitly as a relative String for fs_utf8 compatibility
-    fn resolve_path(&self, name: &str) -> String {
+    /// Resolves an entry name to its extraction path.
+    ///
+    /// With `junk_paths` enabled, all directory components are stripped.
+    /// Names with no usable file-name component (`""`, `"."`, `".."`, `"/"`)
+    /// resolve to an empty string; callers treat that as a signal to skip
+    /// the entry.
+    pub fn resolve_path(&self, name: &str) -> String {
         if self.junk_paths {
-            Path::new(name).file_name().unwrap_or_default().to_string_lossy().into_owned()
+            let trimmed = name.trim_end_matches('/');
+            match Path::new(trimmed).file_name() {
+                Some(f) if !f.is_empty() && f != "." && f != ".." => {
+                    f.to_string_lossy().into_owned()
+                }
+                _ => String::new(),
+            }
         } else {
             name.to_owned()
         }
@@ -424,7 +478,7 @@ impl Driver {
             )?)
             .with(SizePolicy::new(self.limits.max_single_file, self.limits.max_total_bytes))
             .with(CountPolicy::new(self.limits.max_file_count, self.limits.max_dir_count))
-            .with(DepthPolicy::new(self.limits.max_path_depth))
+            .with(DepthPolicy::new_with_junk_paths(self.limits.max_path_depth, self.junk_paths))
             .with(SymlinkPolicy::new(self.symlinks)))
     }
 
@@ -464,14 +518,14 @@ impl Driver {
     ) -> Result<(), Error> {
         let entries = adapter.entries_metadata()?;
         let mut state = ExtractionState::default();
-        let mut total_size: u64 = 0;
 
         for info in &entries {
             // Apply filter during validation to match extraction behavior
             if let Some(ref filter) = self.filter
-                && !filter(info) {
-                    continue; // Skip filtered entries during validation
-                }
+                && !filter(info)
+            {
+                continue; // Skip filtered entries during validation
+            }
 
             // Skip symlinks when policy says to skip them
             if matches!(info.kind, EntryKind::Symlink { .. })
@@ -483,11 +537,11 @@ impl Driver {
             policies.check_all(info, &state)?;
 
             if matches!(info.kind, EntryKind::File) {
-                total_size = total_size.saturating_add(info.size);
-                if total_size > self.limits.max_total_bytes {
+                state.bytes_written = state.bytes_written.saturating_add(info.size);
+                if state.bytes_written > self.limits.max_total_bytes {
                     return Err(Error::TotalSizeExceeded {
                         limit: self.limits.max_total_bytes,
-                        would_be: total_size,
+                        would_be: state.bytes_written,
                     });
                 }
                 state.files_extracted += 1;
@@ -525,10 +579,13 @@ impl Driver {
         }
 
         let safe_path = self.resolve_path(&info.name);
-        let exists = self.dir.symlink_metadata(&safe_path).is_ok();
+        // Names that resolve to nothing (empty, ".", "..") cannot be extracted
+        // as files; treat them as junk and skip rather than erroring on open("").
+        let mut skipped = skipped || safe_path.is_empty();
+        let exists = !safe_path.is_empty() && self.dir.symlink_metadata(&safe_path).is_ok();
 
         if !skipped
-            && matches!(info.kind, EntryKind::File)
+            && matches!(info.kind, EntryKind::File | EntryKind::Hardlink { .. })
             && matches!(self.overwrite, OverwriteMode::Skip)
             && exists
         {
@@ -537,11 +594,12 @@ impl Driver {
 
         let action = if skipped {
             EntryAction::Skipped
-        } else if exists
-            && matches!(info.kind, EntryKind::File)
-            && matches!(self.overwrite, OverwriteMode::Overwrite)
-        {
-            EntryAction::Overwritten
+        } else if exists && matches!(info.kind, EntryKind::File | EntryKind::Hardlink { .. }) {
+            match self.overwrite {
+                OverwriteMode::Overwrite => EntryAction::Overwritten,
+                OverwriteMode::RenameBase | OverwriteMode::RenameExt => EntryAction::Renamed,
+                _ => EntryAction::Created,
+            }
         } else {
             EntryAction::Created
         };
@@ -575,11 +633,22 @@ impl Driver {
             // Cap at the declared size too, so extract_to() can distinguish an
             // entry that merely fills its budget from one that lies about its
             // size and keeps producing data (a classic zip bomb).
-            let limit = info
-                .size
-                .min(self.limits.max_single_file)
-                .min(self.limits.max_total_bytes.saturating_sub(state.bytes_written));
-            let (_, written) = adapter.extract_to(index, &mut outfile, limit)?;
+            let remaining_total = self.limits.max_total_bytes.saturating_sub(state.bytes_written);
+            let limit = info.size.min(self.limits.max_single_file).min(remaining_total);
+            let (_, written) = match adapter.extract_to(index, &mut outfile, limit) {
+                Ok(res) => res,
+                Err(Error::TotalSizeExceeded { .. })
+                    if self.limits.max_single_file < remaining_total
+                        && limit == self.limits.max_single_file =>
+                {
+                    return Err(Error::FileTooLarge {
+                        entry: info.name.clone(),
+                        limit: self.limits.max_single_file,
+                        size: limit.saturating_add(1),
+                    });
+                }
+                Err(e) => return Err(e),
+            };
 
             self.finalize_file(outfile, &info)?;
 
@@ -592,6 +661,7 @@ impl Driver {
 
         Ok(())
     }
+
     /// Convenience: extract ZIP from a file path.
     pub fn extract_zip_file<P: AsRef<Path>>(&self, path: P) -> Result<ExtractionReport, Error> {
         let adapter = ZipAdapter::open(path)?;
@@ -624,10 +694,30 @@ impl Driver {
             // against the limits) every entry twice.
             let mut validation_state = ExtractionState::default();
             for info in &entries {
+                if let Some(ref filter) = self.filter
+                    && !filter(info)
+                {
+                    continue;
+                }
+                if matches!(info.kind, EntryKind::Symlink { .. })
+                    && self.symlinks == SymlinkBehavior::Skip
+                {
+                    continue;
+                }
+                if self.junk_paths && matches!(info.kind, EntryKind::Directory) {
+                    continue;
+                }
+
                 policies.check_all(info, &validation_state)?;
-                if matches!(info.kind, EntryKind::File) {
+                if matches!(info.kind, EntryKind::File | EntryKind::Hardlink { .. }) {
                     validation_state.bytes_written =
                         validation_state.bytes_written.saturating_add(info.size);
+                    if validation_state.bytes_written > self.limits.max_total_bytes {
+                        return Err(Error::TotalSizeExceeded {
+                            limit: self.limits.max_total_bytes,
+                            would_be: validation_state.bytes_written,
+                        });
+                    }
                     validation_state.files_extracted += 1;
                 } else if matches!(info.kind, EntryKind::Directory) && !self.junk_paths {
                     validation_state.dirs_created += 1;
@@ -705,10 +795,12 @@ impl Driver {
         }
 
         let safe_path = self.resolve_path(&info.name);
-        let exists = self.dir.symlink_metadata(&safe_path).is_ok();
+        let mut skipped = skipped || safe_path.is_empty();
+        let is_file_or_hardlink = matches!(info.kind, EntryKind::File | EntryKind::Hardlink { .. });
+        let exists = !safe_path.is_empty() && self.dir.symlink_metadata(&safe_path).is_ok();
 
         if !skipped
-            && matches!(info.kind, EntryKind::File)
+            && is_file_or_hardlink
             && matches!(self.overwrite, OverwriteMode::Skip)
             && exists
         {
@@ -717,11 +809,12 @@ impl Driver {
 
         let action = if skipped {
             EntryAction::Skipped
-        } else if exists
-            && matches!(info.kind, EntryKind::File)
-            && matches!(self.overwrite, OverwriteMode::Overwrite)
-        {
-            EntryAction::Overwritten
+        } else if exists && is_file_or_hardlink {
+            match self.overwrite {
+                OverwriteMode::Overwrite => EntryAction::Overwritten,
+                OverwriteMode::RenameBase | OverwriteMode::RenameExt => EntryAction::Renamed,
+                _ => EntryAction::Created,
+            }
         } else {
             EntryAction::Created
         };
@@ -746,41 +839,50 @@ impl Driver {
         policies.check_all(info, state)?;
         self.prepare_entry_paths(info, &safe_path, state)?;
 
-        if matches!(info.kind, EntryKind::File) {
-            let Some((mut outfile, actual_path)) = self.open_for_write(&safe_path, state)? else {
-                return Ok(());
-            };
-
-            if let Some(reader) = reader {
-                // The header length is authoritative for TAR, but still clamp to
-                // the configured limits in case the policies were relaxed.
-                let budget = self
-                    .limits
-                    .max_single_file
-                    .min(self.limits.max_total_bytes.saturating_sub(state.bytes_written));
-                let limit = info.size.min(budget);
-                let written = crate::adapter::copy_limited(reader, &mut outfile, limit)?;
-                state.bytes_written = state.bytes_written.saturating_add(written);
-
-                // A short read means the archive is truncated or the limits cut
-                // the entry off; either way the file on disk is incomplete.
-                if written < info.size {
-                    return Err(Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "entry '{}' ended after {} of {} declared bytes",
-                            info.name, written, info.size
-                        ),
-                    )));
+        match &info.kind {
+            EntryKind::Hardlink { target } => {
+                let safe_target = self.resolve_path(target);
+                if let Some(actual_path) = self.create_hard_link(&safe_target, &safe_path, state)? {
+                    if actual_path != safe_path {
+                        state.renames.push((safe_path, actual_path));
+                    }
+                    state.files_extracted += 1;
                 }
             }
+            EntryKind::File => {
+                let Some((mut outfile, actual_path)) = self.open_for_write(&safe_path, state)?
+                else {
+                    return Ok(());
+                };
 
-            self.finalize_file(outfile, info)?;
+                if let Some(reader) = reader {
+                    let budget = self
+                        .limits
+                        .max_single_file
+                        .min(self.limits.max_total_bytes.saturating_sub(state.bytes_written));
+                    let limit = info.size.min(budget);
+                    let written = crate::adapter::copy_limited(reader, &mut outfile, limit)?;
+                    state.bytes_written = state.bytes_written.saturating_add(written);
 
-            if actual_path != safe_path {
-                state.renames.push((safe_path, actual_path));
+                    if written < info.size {
+                        return Err(Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            format!(
+                                "entry '{}' ended after {} of {} declared bytes",
+                                info.name, written, info.size
+                            ),
+                        )));
+                    }
+                }
+
+                self.finalize_file(outfile, info)?;
+
+                if actual_path != safe_path {
+                    state.renames.push((safe_path, actual_path));
+                }
+                state.files_extracted += 1;
             }
-            state.files_extracted += 1;
+            _ => {}
         }
 
         Ok(())
@@ -813,10 +915,12 @@ impl Driver {
         }
 
         let safe_path = self.resolve_path(&info.name);
-        let exists = self.dir.symlink_metadata(&safe_path).is_ok();
+        let mut skipped = skipped || safe_path.is_empty();
+        let is_file_or_hardlink = matches!(info.kind, EntryKind::File | EntryKind::Hardlink { .. });
+        let exists = !safe_path.is_empty() && self.dir.symlink_metadata(&safe_path).is_ok();
 
         if !skipped
-            && matches!(info.kind, EntryKind::File)
+            && is_file_or_hardlink
             && matches!(self.overwrite, OverwriteMode::Skip)
             && exists
         {
@@ -825,11 +929,12 @@ impl Driver {
 
         let action = if skipped {
             EntryAction::Skipped
-        } else if exists
-            && matches!(info.kind, EntryKind::File)
-            && matches!(self.overwrite, OverwriteMode::Overwrite)
-        {
-            EntryAction::Overwritten
+        } else if exists && is_file_or_hardlink {
+            match self.overwrite {
+                OverwriteMode::Overwrite => EntryAction::Overwritten,
+                OverwriteMode::RenameBase | OverwriteMode::RenameExt => EntryAction::Renamed,
+                _ => EntryAction::Created,
+            }
         } else {
             EntryAction::Created
         };
@@ -854,23 +959,36 @@ impl Driver {
         policies.check_all(info, state)?;
         self.prepare_entry_paths(info, &safe_path, state)?;
 
-        if matches!(info.kind, EntryKind::File) {
-            let Some((mut outfile, actual_path)) = self.open_for_write(&safe_path, state)? else {
-                return Ok(());
-            };
-
-            if let Some(data) = data {
-                use std::io::Write;
-                outfile.write_all(data)?;
-                state.bytes_written += data.len() as u64;
+        match &info.kind {
+            EntryKind::Hardlink { target } => {
+                let safe_target = self.resolve_path(target);
+                if let Some(actual_path) = self.create_hard_link(&safe_target, &safe_path, state)? {
+                    if actual_path != safe_path {
+                        state.renames.push((safe_path, actual_path));
+                    }
+                    state.files_extracted += 1;
+                }
             }
+            EntryKind::File => {
+                let Some((mut outfile, actual_path)) = self.open_for_write(&safe_path, state)?
+                else {
+                    return Ok(());
+                };
 
-            self.finalize_file(outfile, info)?;
+                if let Some(data) = data {
+                    use std::io::Write;
+                    outfile.write_all(data)?;
+                    state.bytes_written += data.len() as u64;
+                }
 
-            if actual_path != safe_path {
-                state.renames.push((safe_path, actual_path));
+                self.finalize_file(outfile, info)?;
+
+                if actual_path != safe_path {
+                    state.renames.push((safe_path, actual_path));
+                }
+                state.files_extracted += 1;
             }
-            state.files_extracted += 1;
+            _ => {}
         }
 
         Ok(())
@@ -949,6 +1067,39 @@ impl Driver {
         adapter: crate::adapter::SevenZAdapter,
     ) -> Result<ExtractionReport, Error> {
         let policies = self.build_policies()?;
+
+        // ValidateFirst mode: check all entries before extracting
+        if self.validation == ValidationMode::ValidateFirst {
+            let metadata = adapter.entries_metadata();
+            let mut validation_state = ExtractionState::default();
+            for info in &metadata {
+                if let Some(ref filter) = self.filter
+                    && !filter(info)
+                {
+                    continue;
+                }
+                if matches!(info.kind, EntryKind::Symlink { .. })
+                    && self.symlinks == SymlinkBehavior::Skip
+                {
+                    continue;
+                }
+                policies.check_all(info, &validation_state)?;
+                if matches!(info.kind, EntryKind::File) {
+                    validation_state.bytes_written =
+                        validation_state.bytes_written.saturating_add(info.size);
+                    if validation_state.bytes_written > self.limits.max_total_bytes {
+                        return Err(Error::TotalSizeExceeded {
+                            limit: self.limits.max_total_bytes,
+                            would_be: validation_state.bytes_written,
+                        });
+                    }
+                    validation_state.files_extracted += 1;
+                } else if matches!(info.kind, EntryKind::Directory) && !self.junk_paths {
+                    validation_state.dirs_created += 1;
+                }
+            }
+        }
+
         let mut state = ExtractionState::default();
         let total_entries = adapter.len();
         let mut entry_index = 0;
@@ -995,6 +1146,7 @@ impl Driver {
         }
 
         let safe_path = self.resolve_path(&info.name);
+        let mut skipped = skipped || safe_path.is_empty();
         let exists = self.dir.symlink_metadata(&safe_path).is_ok();
 
         if !skipped
@@ -1007,11 +1159,12 @@ impl Driver {
 
         let action = if skipped {
             EntryAction::Skipped
-        } else if exists
-            && matches!(info.kind, EntryKind::File)
-            && matches!(self.overwrite, OverwriteMode::Overwrite)
-        {
-            EntryAction::Overwritten
+        } else if exists && matches!(info.kind, EntryKind::File) {
+            match self.overwrite {
+                OverwriteMode::Overwrite => EntryAction::Overwritten,
+                OverwriteMode::RenameBase | OverwriteMode::RenameExt => EntryAction::Renamed,
+                _ => EntryAction::Created,
+            }
         } else {
             EntryAction::Created
         };
@@ -1061,22 +1214,15 @@ impl Driver {
     /// Convenience: extract 7z from a file path.
     #[cfg(feature = "sevenz")]
     pub fn extract_7z_file<P: AsRef<Path>>(&self, path: P) -> Result<ExtractionReport, Error> {
-        let adapter = crate::adapter::SevenZAdapter::open_with_limit(
-            path,
-            None,
-            self.limits.max_total_bytes,
-        )?;
+        let adapter = crate::adapter::SevenZAdapter::open_with_limits(path, None, &self.limits)?;
         self.extract_7z(adapter)
     }
 
     /// Convenience: extract 7z from bytes.
     #[cfg(feature = "sevenz")]
     pub fn extract_7z_bytes(&self, data: &[u8]) -> Result<ExtractionReport, Error> {
-        let adapter = crate::adapter::SevenZAdapter::from_bytes_with_limit(
-            data,
-            None,
-            self.limits.max_total_bytes,
-        )?;
+        let adapter =
+            crate::adapter::SevenZAdapter::from_bytes_with_limits(data, None, &self.limits)?;
         self.extract_7z(adapter)
     }
 }

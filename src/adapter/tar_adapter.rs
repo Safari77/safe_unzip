@@ -61,12 +61,19 @@ impl<R: Read> TarAdapter<R> {
             let kind = match entry_type {
                 tar::EntryType::Regular | tar::EntryType::Continuous => EntryKind::File,
                 tar::EntryType::Directory => EntryKind::Directory,
-                tar::EntryType::Symlink | tar::EntryType::Link => {
+                tar::EntryType::Symlink => {
                     let target = entry
                         .link_name()?
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     EntryKind::Symlink { target }
+                }
+                tar::EntryType::Link => {
+                    let target = entry
+                        .link_name()?
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    EntryKind::Hardlink { target }
                 }
                 // Reject device files, fifos, etc. - these are security risks
                 other => {
@@ -137,12 +144,19 @@ impl<R: Read> TarAdapter<R> {
             let kind = match entry_type {
                 tar::EntryType::Regular | tar::EntryType::Continuous => EntryKind::File,
                 tar::EntryType::Directory => EntryKind::Directory,
-                tar::EntryType::Symlink | tar::EntryType::Link => {
+                tar::EntryType::Symlink => {
                     let target = entry
                         .link_name()?
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     EntryKind::Symlink { target }
+                }
+                tar::EntryType::Link => {
+                    let target = entry
+                        .link_name()?
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    EntryKind::Hardlink { target }
                 }
                 // Reject device files, fifos, etc. - these are security risks
                 other => {
@@ -180,6 +194,16 @@ impl<R: Read> TarAdapter<R> {
                 // Read at most the declared size: a header that understates the
                 // real content must not be able to grow the buffer past the limit.
                 let read = super::copy_limited(&mut entry, &mut data, info.size)?;
+                if read < info.size {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "entry '{}' ended after {} of {} declared bytes",
+                            name, read, info.size
+                        ),
+                    )));
+                }
+
                 if read == info.size && super::has_more_data(&mut entry)? {
                     return Err(Error::SizeMismatch {
                         entry: name,

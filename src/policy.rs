@@ -120,13 +120,20 @@ impl PathPolicy {
                 if let Component::Normal(s) = component
                     && let Some(s) = s.to_str()
                 {
+                    if s.ends_with(' ') || s.ends_with('.') {
+                        return Err(
+                            "filename ends with dot or space (Windows reserved)".to_string()
+                        );
+                    }
+
                     let s_upper = s.to_ascii_uppercase();
                     let file_stem = s_upper.split('.').next().unwrap_or(&s_upper);
 
                     match file_stem {
-                        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4"
-                        | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3"
-                        | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => {
+                        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+                        | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8"
+                        | "COM9" | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7"
+                        | "LPT8" | "LPT9" => {
                             return Err("Windows reserved name".to_string());
                         }
                         _ => {}
@@ -137,40 +144,63 @@ impl PathPolicy {
 
         Ok(())
     }
-}
 
-impl Policy for PathPolicy {
-    fn check(&self, entry: &EntryInfo, _state: &ExtractionState) -> Result<(), Error> {
+    fn validate_path(&self, raw_path: &str, is_dir: bool) -> Result<(), Error> {
         if let Err(reason) =
-            Self::validate_filename(&entry.name, self.allow_windows_reserved, self.max_path_len)
+            Self::validate_filename(raw_path, self.allow_windows_reserved, self.max_path_len)
         {
-            return Err(Error::InvalidFilename { entry: entry.name.clone(), reason });
+            return Err(Error::InvalidFilename { entry: raw_path.to_string(), reason });
         }
 
-        // 2. If junk_paths is enabled, all directories are stripped natively.
-        // We can safely bypass the traversal checks because we only extract the filename.
         if self.junk_paths {
-            return Ok(());
+            if is_dir || raw_path.ends_with('/') {
+                return Ok(());
+            }
+            let trimmed = raw_path.trim_end_matches('/');
+            match Path::new(trimmed).file_name() {
+                Some(fname) if !fname.is_empty() && fname != "." && fname != ".." => {
+                    return Ok(());
+                }
+                _ => {
+                    return Err(Error::PathEscape {
+                        entry: raw_path.to_string(),
+                        detail: "Invalid filename after stripping directory path".to_string(),
+                    });
+                }
+            }
         }
 
-        let path = Path::new(&entry.name);
+        let path = Path::new(raw_path);
         for comp in path.components() {
             match comp {
                 Component::ParentDir => {
                     return Err(Error::PathEscape {
-                        entry: entry.name.clone(),
+                        entry: raw_path.to_string(),
                         detail: "Contains parent directory (..) component".to_string(),
                     });
                 }
                 Component::RootDir | Component::Prefix(_) => {
                     return Err(Error::PathEscape {
-                        entry: entry.name.clone(),
+                        entry: raw_path.to_string(),
                         detail: "Contains absolute path component".to_string(),
                     });
                 }
                 _ => {}
             }
         }
+        Ok(())
+    }
+}
+
+impl Policy for PathPolicy {
+    fn check(&self, entry: &EntryInfo, _state: &ExtractionState) -> Result<(), Error> {
+        let is_dir = matches!(entry.kind, EntryKind::Directory);
+        self.validate_path(&entry.name, is_dir)?;
+
+        if let EntryKind::Hardlink { target } = &entry.kind {
+            self.validate_path(target, false)?;
+        }
+
         Ok(())
     }
 }
@@ -261,18 +291,32 @@ impl Policy for CountPolicy {
 pub struct DepthPolicy {
     /// Maximum directory depth.
     pub max_depth: usize,
+    /// Whether directory structure is flattened.
+    pub junk_paths: bool,
 }
 
 impl DepthPolicy {
     /// Create a new depth policy.
     pub fn new(max_depth: usize) -> Self {
-        Self { max_depth }
+        Self { max_depth, junk_paths: false }
+    }
+
+    /// Create a new depth policy with `junk_paths` awareness.
+    pub fn new_with_junk_paths(max_depth: usize, junk_paths: bool) -> Self {
+        Self { max_depth, junk_paths }
     }
 }
 
 impl Policy for DepthPolicy {
     fn check(&self, entry: &EntryInfo, _state: &ExtractionState) -> Result<(), Error> {
-        let depth = Path::new(&entry.name).components().count();
+        let depth = if self.junk_paths {
+            usize::from(!matches!(entry.kind, EntryKind::Directory))
+        } else {
+            Path::new(&entry.name)
+                .components()
+                .filter(|c| matches!(c, Component::Normal(_)))
+                .count()
+        };
         if depth > self.max_depth {
             return Err(Error::PathTooDeep {
                 entry: entry.name.clone(),
@@ -347,6 +391,7 @@ pub struct PolicyConfig {
     pub symlink_behavior: SymlinkBehavior,
     pub allow_windows_reserved: bool,
     pub max_path_len: usize,
+    pub junk_paths: bool,
 }
 
 impl PolicyConfig {
@@ -355,13 +400,13 @@ impl PolicyConfig {
         Ok(PolicyChain::new()
             .with(PathPolicy::new(
                 &self.destination,
-                false,
+                self.junk_paths,
                 self.allow_windows_reserved,
                 self.max_path_len,
             )?)
             .with(SizePolicy::new(self.max_single_file, self.max_total))
             .with(CountPolicy::new(self.max_files, self.max_dirs))
-            .with(DepthPolicy::new(self.max_depth))
+            .with(DepthPolicy::new_with_junk_paths(self.max_depth, self.junk_paths))
             .with(SymlinkPolicy::new(self.symlink_behavior)))
     }
 }

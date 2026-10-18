@@ -98,23 +98,42 @@ impl<R: Read + Seek> ZipAdapter<R> {
         F: FnMut(EntryInfo, Option<&mut dyn Read>) -> Result<bool, Error>,
     {
         for i in 0..self.archive.len() {
+            // Check encryption status via raw metadata and drop borrow before decrypting
+            let (is_encrypted, raw_name) = {
+                let raw_entry = self.archive.by_index_raw(i)?;
+                (raw_entry.encrypted(), raw_entry.name()?.to_string())
+            };
+            if is_encrypted && self.password.is_none() {
+                return Err(Error::EncryptedEntry { entry: raw_name });
+            }
+
             let mut entry = match &self.password {
                 Some(pwd) => self.archive.by_index_decrypt(i, pwd)?,
                 None => self.archive.by_index(i)?,
             };
             let name = entry.name()?.into_owned();
 
-            // Reject encrypted entries we have no way of reading
-            if entry.encrypted() && self.password.is_none() {
-                return Err(Error::EncryptedEntry { entry: name });
-            }
-
             // Determine entry kind and read symlink target if applicable
             let kind = if entry.is_dir() {
                 EntryKind::Directory
             } else if entry.is_symlink() {
-                let mut target = String::new();
-                entry.read_to_string(&mut target)?;
+                let mut target_buf = [0u8; 4096];
+                let mut total_read = 0;
+                loop {
+                    let n = entry.read(&mut target_buf[total_read..])?;
+                    if n == 0 {
+                        break;
+                    }
+                    total_read += n;
+                    if total_read == target_buf.len() && crate::adapter::has_more_data(&mut entry)?
+                    {
+                        return Err(Error::InvalidFilename {
+                            entry: name,
+                            reason: "symlink target exceeds 4096 bytes".to_string(),
+                        });
+                    }
+                }
+                let target = String::from_utf8_lossy(&target_buf[..total_read]).into_owned();
                 EntryKind::Symlink { target }
             } else {
                 EntryKind::File
@@ -156,6 +175,15 @@ impl<R: Read + Seek> ZipAdapter<R> {
         writer: &mut W,
         limit: u64,
     ) -> Result<(EntryInfo, u64), Error> {
+        // Inspect raw metadata and drop borrow before opening entry
+        let (is_encrypted, raw_name) = {
+            let raw_entry = self.archive.by_index_raw(index)?;
+            (raw_entry.encrypted(), raw_entry.name()?.to_string())
+        };
+        if is_encrypted && self.password.is_none() {
+            return Err(Error::EncryptedEntry { entry: raw_name });
+        }
+
         let mut entry = match &self.password {
             Some(pwd) => self.archive.by_index_decrypt(index, pwd)?,
             None => self.archive.by_index(index)?,
@@ -163,16 +191,25 @@ impl<R: Read + Seek> ZipAdapter<R> {
 
         let name = entry.name()?.into_owned();
 
-        // Reject encrypted entries
-        if entry.encrypted() && self.password.is_none() {
-            return Err(Error::EncryptedEntry { entry: name });
-        }
-
         let kind = if entry.is_dir() {
             EntryKind::Directory
         } else if entry.is_symlink() {
-            let mut target = String::new();
-            entry.read_to_string(&mut target)?;
+            let mut target_buf = [0u8; 4096];
+            let mut total_read = 0;
+            loop {
+                let n = entry.read(&mut target_buf[total_read..])?;
+                if n == 0 {
+                    break;
+                }
+                total_read += n;
+                if total_read == target_buf.len() && crate::adapter::has_more_data(&mut entry)? {
+                    return Err(Error::InvalidFilename {
+                        entry: name,
+                        reason: "symlink target exceeds 4096 bytes".to_string(),
+                    });
+                }
+            }
+            let target = String::from_utf8_lossy(&target_buf[..total_read]).into_owned();
             EntryKind::Symlink { target }
         } else {
             EntryKind::File
@@ -189,15 +226,29 @@ impl<R: Read + Seek> ZipAdapter<R> {
         let bytes_written = if matches!(kind, EntryKind::File) {
             let written = crate::adapter::copy_limited(&mut entry, writer, limit)?;
 
-            // SECURITY: a zip bomb can declare a tiny uncompressed size and then
-            // expand to gigabytes. copy_limited() stops at the limit, so probe
-            // for leftover data rather than silently writing a truncated file.
             if written == limit && crate::adapter::has_more_data(&mut entry)? {
-                return Err(Error::SizeMismatch {
-                    entry: info.name.clone(),
-                    declared: info.size,
-                    actual: written.saturating_add(1),
-                });
+                if limit < info.size {
+                    return Err(Error::TotalSizeExceeded {
+                        limit,
+                        would_be: limit.saturating_add(1),
+                    });
+                } else {
+                    return Err(Error::SizeMismatch {
+                        entry: info.name.clone(),
+                        declared: info.size,
+                        actual: written.saturating_add(1),
+                    });
+                }
+            }
+
+            if written < info.size && limit >= info.size {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "entry '{}' ended after {} of {} declared bytes",
+                        info.name, written, info.size
+                    ),
+                )));
             }
 
             written

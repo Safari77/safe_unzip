@@ -648,7 +648,8 @@ fn test_tar_hard_link_treated_as_symlink() {
 
     let tar_data = builder.into_inner().unwrap();
 
-    // With skip policy, hard link should be skipped
+    // Hard links are now supported as real links rather than misclassified as symlinks,
+    // so even with SymlinkBehavior::Skip (or Error), hard links are extracted rather than skipped.
     let adapter = TarAdapter::new(std::io::Cursor::new(tar_data));
     let report = Driver::new(dest.path())
         .unwrap()
@@ -656,10 +657,21 @@ fn test_tar_hard_link_treated_as_symlink() {
         .extract_tar(adapter)
         .unwrap();
 
-    assert_eq!(report.files_extracted, 1);
-    assert_eq!(report.entries_skipped, 1);
+    assert_eq!(report.files_extracted, 2);
+    assert_eq!(report.entries_skipped, 0);
     assert!(dest.path().join("original.txt").exists());
-    assert!(!dest.path().join("hardlink.txt").exists());
+    assert!(dest.path().join("hardlink.txt").exists());
 
-    println!("✅ TAR hard link handled as symlink");
+    let content = std::fs::read_to_string(dest.path().join("hardlink.txt")).unwrap();
+    assert_eq!(content, "hello");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta1 = std::fs::metadata(dest.path().join("original.txt")).unwrap();
+        let meta2 = std::fs::metadata(dest.path().join("hardlink.txt")).unwrap();
+        assert_eq!(meta1.ino(), meta2.ino(), "hardlink must share inode with original");
+    }
+
+    println!("✅ TAR hard link handled properly as hard link");
 }

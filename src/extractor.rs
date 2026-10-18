@@ -90,6 +90,7 @@ pub enum EntryAction {
     Created,
     Overwritten,
     Skipped,
+    Renamed,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -419,6 +420,16 @@ impl Extractor {
         let mut created_dirs = std::collections::HashSet::new();
 
         for i in 0..total_entries {
+            // Check encryption status via raw metadata first so missing passwords
+            // produce Error::EncryptedEntry instead of a generic ZipError.
+            {
+                let raw_entry = archive.by_index_raw(i)?;
+                if raw_entry.encrypted() && self.password.is_none() {
+                    let raw_name = raw_entry.name()?.into_owned();
+                    return Err(Error::EncryptedEntry { entry: raw_name });
+                }
+            }
+
             let mut entry = match &self.password {
                 Some(pwd) => archive.by_index_decrypt(i, pwd)?,
                 None => archive.by_index(i)?,
@@ -430,11 +441,13 @@ impl Extractor {
                 return Err(Error::InvalidFilename { entry: name, reason: reason.to_string() });
             }
 
-            // 0.5 SECURITY: Zip Slip. cap-std refuses to follow an escaping path
-            // anyway, but that arrives as an opaque I/O error, so reject it here
-            // to report Error::PathEscape naming the offending entry. This
-            // mirrors validate_all(), which only runs in ValidateFirst mode.
-            // With junk_paths only the file name survives, so it cannot escape.
+            // 0.25 Skip directories cleanly under junk_paths before processing path components
+            if self.junk_paths && (entry.is_dir() || name.ends_with('/')) {
+                report.entries_skipped += 1;
+                continue;
+            }
+
+            // 0.5 SECURITY: Zip Slip check
             if !self.junk_paths {
                 for comp in Path::new(&name).components() {
                     match comp {
@@ -457,22 +470,27 @@ impl Extractor {
 
             // 1. Modified Path Resolution
             let safe_relative_path = if self.junk_paths {
-                Path::new(&name)
-                    .file_name()
-                    .ok_or_else(|| Error::InvalidFilename {
-                        entry: name.clone(),
-                        reason: "entry has no filename".to_string(),
-                    })?
-                    .to_string_lossy()
-                    .into_owned()
+                let trimmed = name.trim_end_matches('/');
+                match Path::new(trimmed).file_name() {
+                    Some(fname) if !fname.is_empty() && fname != "." && fname != ".." => {
+                        fname.to_string_lossy().into_owned()
+                    }
+                    _ => {
+                        return Err(Error::PathEscape {
+                            entry: name,
+                            detail: "Invalid filename after stripping directory path".to_string(),
+                        });
+                    }
+                }
             } else {
                 name.clone()
             };
 
+            let declared_size = entry.size();
             let mtime = crate::adapter::zip_adapter::zip_time_to_timestamp(entry.last_modified());
             let info = EntryInfo {
                 name: &name,
-                size: entry.size(),
+                size: declared_size,
                 compressed_size: entry.compressed_size(),
                 is_dir: entry.is_dir(),
                 is_symlink: entry.is_symlink(),
@@ -487,16 +505,11 @@ impl Extractor {
                     SymlinkPolicy::Error => {
                         return Err(Error::SymlinkNotAllowed {
                             entry: name,
-                            target: String::new(), // ZIP symlink targets require reading content
+                            target: String::new(),
                         });
                     }
                     SymlinkPolicy::Skip => skipped = true,
                 }
-            }
-
-            // 2.5 CHECK: Junk Paths (Skip Directories)
-            if self.junk_paths && entry.is_dir() {
-                skipped = true;
             }
 
             // 3. CHECK: Filter (User Logic)
@@ -521,11 +534,14 @@ impl Extractor {
 
             let action = if skipped {
                 EntryAction::Skipped
-            } else if exists
-                && !entry.is_dir()
-                && matches!(self.overwrite, OverwritePolicy::Overwrite)
-            {
-                EntryAction::Overwritten
+            } else if exists && !entry.is_dir() {
+                match self.overwrite {
+                    OverwritePolicy::Overwrite => EntryAction::Overwritten,
+                    OverwritePolicy::RenameBase | OverwritePolicy::RenameExt => {
+                        EntryAction::Renamed
+                    }
+                    _ => EntryAction::Created,
+                }
             } else {
                 EntryAction::Created
             };
@@ -534,7 +550,7 @@ impl Extractor {
             if let Some(ref callback) = self.on_progress {
                 callback(&Progress {
                     entry_name: name.clone(),
-                    entry_size: entry.size(),
+                    entry_size: declared_size,
                     entry_index: i,
                     total_entries,
                     bytes_written: total_bytes_written,
@@ -549,9 +565,11 @@ impl Extractor {
             }
 
             // 4. CHECK: Limits (Depth)
-            // Count normal components to check depth
-            let depth =
-                Path::new(&name).components().filter(|c| matches!(c, Component::Normal(_))).count();
+            let depth = if self.junk_paths {
+                usize::from(!entry.is_dir())
+            } else {
+                Path::new(&name).components().filter(|c| matches!(c, Component::Normal(_))).count()
+            };
             if depth > self.limits.max_path_depth {
                 return Err(Error::PathTooDeep {
                     entry: name,
@@ -577,16 +595,16 @@ impl Extractor {
             }
 
             // Check single file size (declared)
-            if !entry.is_dir() && entry.size() > self.limits.max_single_file {
+            if !entry.is_dir() && declared_size > self.limits.max_single_file {
                 return Err(Error::FileTooLarge {
                     entry: name,
                     limit: self.limits.max_single_file,
-                    size: entry.size(),
+                    size: declared_size,
                 });
             }
 
             // Check total size (Lookahead declared)
-            let would_be = total_bytes_written.saturating_add(entry.size());
+            let would_be = total_bytes_written.saturating_add(declared_size);
             if would_be > self.limits.max_total_bytes {
                 return Err(Error::TotalSizeExceeded {
                     limit: self.limits.max_total_bytes,
@@ -596,43 +614,32 @@ impl Extractor {
 
             // 7. EXECUTION
             if entry.is_dir() {
-                // Directory entries carry a trailing '/', the parent path of a
-                // file entry does not. Normalise so the same directory reached
-                // both ways is created (and counted) only once.
                 let dir_key = safe_relative_path.trim_end_matches('/').to_string();
-                if !dir_key.is_empty() && created_dirs.insert(dir_key.clone()) {
-                    if report.dirs_created >= self.limits.max_dir_count {
-                        return Err(Error::DirCountExceeded {
-                            limit: self.limits.max_dir_count,
-                            attempted: report.dirs_created + 1,
-                        });
-                    }
+                if !dir_key.is_empty() {
                     crate::entry::ensure_directory(
                         &self.dir,
                         &dir_key,
                         self.dir_mode.or_else(|| entry.unix_mode()),
+                        &mut created_dirs,
+                        &mut report.dirs_created,
+                        self.limits.max_dir_count,
                     )?;
-                    report.dirs_created += 1;
                 }
             } else {
                 if !self.junk_paths
                     && let Some(parent) = camino::Utf8Path::new(&safe_relative_path).parent()
                     && !parent.as_str().is_empty()
                 {
-                    let parent_str = parent.as_str();
-                    if created_dirs.insert(parent_str.to_string()) {
-                        if report.dirs_created >= self.limits.max_dir_count {
-                            return Err(Error::DirCountExceeded {
-                                limit: self.limits.max_dir_count,
-                                attempted: report.dirs_created + 1,
-                            });
-                        }
-                        crate::entry::ensure_directory(&self.dir, parent_str, self.dir_mode)?;
-                        report.dirs_created += 1;
-                    }
+                    crate::entry::ensure_directory(
+                        &self.dir,
+                        parent.as_str(),
+                        self.dir_mode,
+                        &mut created_dirs,
+                        &mut report.dirs_created,
+                        self.limits.max_dir_count,
+                    )?;
                 }
 
-                // SECURITY: Atomic file creation based on overwrite policy utilizing openat2 under the hood
                 let mut actual_path = safe_relative_path.clone();
                 let outfile = match self.overwrite {
                     OverwritePolicy::Error => {
@@ -693,21 +700,19 @@ impl Extractor {
                                                 utf8_path.file_name().unwrap_or("file"),
                                                 i
                                             )
+                                        } else if let Some(ext) = utf8_path.extension() {
+                                            format!(
+                                                "{}_{}.{}",
+                                                utf8_path.file_stem().unwrap_or("file"),
+                                                i,
+                                                ext
+                                            )
                                         } else {
-                                            if let Some(ext) = utf8_path.extension() {
-                                                format!(
-                                                    "{}_{}.{}",
-                                                    utf8_path.file_stem().unwrap(),
-                                                    i,
-                                                    ext
-                                                )
-                                            } else {
-                                                format!(
-                                                    "{}_{}",
-                                                    utf8_path.file_name().unwrap_or("file"),
-                                                    i
-                                                )
-                                            }
+                                            format!(
+                                                "{}_{}",
+                                                utf8_path.file_name().unwrap_or("file"),
+                                                i
+                                            )
                                         };
                                     actual_path = if parent.as_str().is_empty() {
                                         new_name
@@ -722,61 +727,42 @@ impl Extractor {
                     }
                 };
 
-                // SECURITY: LimitReader
-                // Enforce:
-                // 1. entry.size() (Declared size) - catch bombs that lie
-                // 2. limits.max_single_file - catch bombs exceeding limit
-                // 3. limits.max_total_bytes - catch global limit violation
-
-                let limit_single = self.limits.max_single_file.min(entry.size());
-                let remaining_global =
-                    self.limits.max_total_bytes.saturating_sub(total_bytes_written);
-                let hard_limit = limit_single.min(remaining_global);
-
-                let mut limiter = LimitReader::new(&mut entry, hard_limit);
+                // Read up to declared entry size
                 let mut outfile = outfile;
-
                 let mut buffer = [0u8; 65536];
                 let mut written = 0;
 
-                loop {
-                    let len = limiter.read(&mut buffer)?;
-                    if len == 0 {
-                        break;
+                {
+                    let mut limiter = LimitReader::new(&mut entry, declared_size);
+                    loop {
+                        let len = limiter.read(&mut buffer)?;
+                        if len == 0 {
+                            break;
+                        }
+                        outfile.write_all(&buffer[..len])?;
+                        written += len as u64;
                     }
-                    outfile.write_all(&buffer[..len])?;
-                    written += len as u64;
                 }
 
-                if limiter.hit_limit {
-                    if written >= self.limits.max_single_file
-                        && entry.size() > self.limits.max_single_file
-                    {
-                        return Err(Error::FileTooLarge {
-                            entry: name,
-                            limit: self.limits.max_single_file,
-                            size: written + 1,
-                        });
-                    }
-
-                    if remaining_global <= written && written < entry.size() {
-                        return Err(Error::TotalSizeExceeded {
-                            limit: self.limits.max_total_bytes,
-                            would_be: total_bytes_written + written + 1,
-                        });
-                    }
+                // Error if archive entry is truncated
+                if written < declared_size {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "entry '{}' ended after {} of {} declared bytes",
+                            name, written, declared_size
+                        ),
+                    )));
                 }
 
                 // SECURITY: Detect zip bombs that lie about declared size.
-                if written == entry.size() {
-                    let mut buf = [0u8; 1];
-                    if entry.read(&mut buf)? > 0 {
-                        return Err(Error::SizeMismatch {
-                            entry: name.clone(),
-                            declared: entry.size(),
-                            actual: entry.size() + 1,
-                        });
-                    }
+                let mut probe = [0u8; 1];
+                if entry.read(&mut probe)? > 0 {
+                    return Err(Error::SizeMismatch {
+                        entry: name.clone(),
+                        declared: declared_size,
+                        actual: written.saturating_add(1),
+                    });
                 }
 
                 total_bytes_written += written;
@@ -785,13 +771,11 @@ impl Extractor {
 
                 let std_outfile = outfile.into_std();
 
-                // 2. PERMISSIONS: Apply via the open File Descriptor (faster and safer)
                 #[cfg(unix)]
                 {
                     if let Some(mode) = self.file_mode.or_else(|| entry.unix_mode()) {
                         use std::os::unix::fs::PermissionsExt;
                         let safe_mode = mode & 0o0777;
-
                         std_outfile.set_permissions(std::fs::Permissions::from_mode(safe_mode))?;
                     }
                 }
@@ -833,20 +817,42 @@ impl Extractor {
             let entry = archive.by_index_raw(i)?;
             let name = entry.name()?.into_owned();
 
+            if entry.encrypted() && self.password.is_none() {
+                return Err(Error::EncryptedEntry { entry: name });
+            }
+
             // 0. Filename sanitization
             if let Err(reason) = self.validate_filename(&name) {
                 return Err(Error::InvalidFilename { entry: name, reason: reason.to_string() });
             }
 
             // 1. Path validation (Zip Slip early check)
-            let path = Path::new(&name);
-            for comp in path.components() {
-                if matches!(comp, Component::ParentDir | Component::RootDir | Component::Prefix(_))
-                {
-                    return Err(Error::PathEscape {
-                        entry: name.clone(),
-                        detail: "Invalid path component detected".to_string(),
-                    });
+            if self.junk_paths {
+                if !entry.is_dir() && !name.ends_with('/') {
+                    let trimmed = name.trim_end_matches('/');
+                    match Path::new(trimmed).file_name() {
+                        Some(fname) if !fname.is_empty() && fname != "." && fname != ".." => {}
+                        _ => {
+                            return Err(Error::PathEscape {
+                                entry: name,
+                                detail: "Invalid filename after stripping directory path"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                }
+            } else {
+                let path = Path::new(&name);
+                for comp in path.components() {
+                    if matches!(
+                        comp,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    ) {
+                        return Err(Error::PathEscape {
+                            entry: name.clone(),
+                            detail: "Invalid path component detected".to_string(),
+                        });
+                    }
                 }
             }
 
@@ -856,8 +862,11 @@ impl Extractor {
             }
 
             // 3. Path depth check
-            let depth =
-                Path::new(&name).components().filter(|c| matches!(c, Component::Normal(_))).count();
+            let depth = if self.junk_paths {
+                usize::from(!entry.is_dir())
+            } else {
+                Path::new(&name).components().filter(|c| matches!(c, Component::Normal(_))).count()
+            };
             if depth > self.limits.max_path_depth {
                 return Err(Error::PathTooDeep {
                     entry: name,
@@ -951,33 +960,93 @@ impl Extractor {
         let mut bytes_verified = 0u64;
 
         for i in 0..archive.len() {
+            {
+                let raw_entry = archive.by_index_raw(i)?;
+                if raw_entry.encrypted() && self.password.is_none() {
+                    let raw_name = raw_entry.name()?.into_owned();
+                    return Err(Error::EncryptedEntry { entry: raw_name });
+                }
+            }
+
             let mut entry = match &self.password {
                 Some(pwd) => archive.by_index_decrypt(i, pwd)?,
                 None => archive.by_index(i)?,
             };
             let name = entry.name()?.into_owned();
 
-            if entry.encrypted() && self.password.is_none() {
-                return Err(Error::EncryptedEntry { entry: name });
-            }
-
             if entry.is_dir() || entry.is_symlink() {
                 continue;
             }
 
-            // Read the entire entry (triggers CRC validation in zip crate)
+            if entries_verified >= self.limits.max_file_count {
+                return Err(Error::FileCountExceeded {
+                    limit: self.limits.max_file_count,
+                    attempted: entries_verified + 1,
+                });
+            }
+
+            let declared_size = entry.size();
+            if declared_size > self.limits.max_single_file {
+                return Err(Error::FileTooLarge {
+                    entry: name,
+                    limit: self.limits.max_single_file,
+                    size: declared_size,
+                });
+            }
+
+            let would_be = bytes_verified.saturating_add(declared_size);
+            if would_be > self.limits.max_total_bytes {
+                return Err(Error::TotalSizeExceeded {
+                    limit: self.limits.max_total_bytes,
+                    would_be,
+                });
+            }
+
+            // Read the entry capped at declared_size (triggers CRC validation in zip crate on EOF)
             let mut buf = [0u8; 65536];
             let mut entry_bytes = 0u64;
-            loop {
-                match entry.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => entry_bytes += n as u64,
-                    Err(e) => {
-                        return Err(Error::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("CRC check failed for '{}': {}", name, e),
-                        )));
+            {
+                let mut limiter = LimitReader::new(&mut entry, declared_size);
+                loop {
+                    match limiter.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => entry_bytes += n as u64,
+                        Err(e) => {
+                            return Err(Error::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("CRC check failed for '{}': {}", name, e),
+                            )));
+                        }
                     }
+                }
+            }
+
+            if entry_bytes < declared_size {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "entry '{}' ended after {} of {} declared bytes",
+                        name, entry_bytes, declared_size
+                    ),
+                )));
+            }
+
+            // Check if entry has more data than declared (zip bomb)
+            let mut probe = [0u8; 1];
+            match entry.read(&mut probe) {
+                Ok(n) if n > 0 => {
+                    return Err(Error::SizeMismatch {
+                        entry: name,
+                        declared: declared_size,
+                        actual: entry_bytes.saturating_add(1),
+                    });
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("CRC check failed for '{}': {}", name, e),
+                    )));
                 }
             }
 
@@ -1032,13 +1101,20 @@ impl Extractor {
                 if let Component::Normal(os_str) = component
                     && let Some(s) = os_str.to_str()
                 {
+                    if s.ends_with(' ') || s.ends_with('.') {
+                        return Err(
+                            "filename ends with dot or space (Windows reserved)".to_string()
+                        );
+                    }
+
                     let s_upper = s.to_ascii_uppercase();
                     let file_stem = s_upper.split('.').next().unwrap_or(&s_upper);
 
                     match file_stem {
-                        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4"
-                        | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3"
-                        | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => {
+                        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+                        | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8"
+                        | "COM9" | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7"
+                        | "LPT8" | "LPT9" => {
                             return Err("Windows reserved name".to_string());
                         }
                         _ => {}

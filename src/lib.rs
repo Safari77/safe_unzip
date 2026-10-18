@@ -255,12 +255,19 @@ pub fn list_tar<R: std::io::Read>(reader: R) -> Result<Vec<entry::EntryInfo>, Er
         let kind = match entry_type {
             tar::EntryType::Regular | tar::EntryType::Continuous => EntryKind::File,
             tar::EntryType::Directory => EntryKind::Directory,
-            tar::EntryType::Symlink | tar::EntryType::Link => {
+            tar::EntryType::Symlink => {
                 let target = entry
                     .link_name()?
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 EntryKind::Symlink { target }
+            }
+            tar::EntryType::Link => {
+                let target = entry
+                    .link_name()?
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                EntryKind::Hardlink { target }
             }
             other => {
                 return Err(Error::UnsupportedEntryType {

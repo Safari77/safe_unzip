@@ -35,10 +35,7 @@ fn test_driver_basic_extraction() {
     let zip_file = create_simple_zip("hello.txt", b"Hello, World!");
 
     let adapter = ZipAdapter::new(zip_file).unwrap();
-    let report = Driver::new(dest.path())
-        .unwrap()
-        .extract_zip(adapter)
-        .unwrap();
+    let report = Driver::new(dest.path()).unwrap().extract_zip(adapter).unwrap();
 
     assert_eq!(report.files_extracted, 1);
     assert_eq!(report.bytes_written, 13);
@@ -53,17 +50,11 @@ fn test_driver_basic_extraction() {
 #[test]
 fn test_driver_multiple_files() {
     let dest = tempdir().unwrap();
-    let zip_file = create_multi_file_zip(&[
-        ("a.txt", b"aaa"),
-        ("b.txt", b"bbb"),
-        ("subdir/c.txt", b"ccc"),
-    ]);
+    let zip_file =
+        create_multi_file_zip(&[("a.txt", b"aaa"), ("b.txt", b"bbb"), ("subdir/c.txt", b"ccc")]);
 
     let adapter = ZipAdapter::new(zip_file).unwrap();
-    let report = Driver::new(dest.path())
-        .unwrap()
-        .extract_zip(adapter)
-        .unwrap();
+    let report = Driver::new(dest.path()).unwrap().extract_zip(adapter).unwrap();
 
     assert_eq!(report.files_extracted, 3);
     assert!(dest.path().join("a.txt").exists());
@@ -126,18 +117,13 @@ fn test_driver_overwrite_error() {
     // First extraction
     let zip1 = create_simple_zip("test.txt", b"original");
     let adapter1 = ZipAdapter::new(zip1).unwrap();
-    Driver::new(dest.path())
-        .unwrap()
-        .extract_zip(adapter1)
-        .unwrap();
+    Driver::new(dest.path()).unwrap().extract_zip(adapter1).unwrap();
 
     // Second extraction should fail (default is Error)
     let zip2 = create_simple_zip("test.txt", b"modified");
     let adapter2 = ZipAdapter::new(zip2).unwrap();
-    let result = Driver::new(dest.path())
-        .unwrap()
-        .overwrite(OverwriteMode::Error)
-        .extract_zip(adapter2);
+    let result =
+        Driver::new(dest.path()).unwrap().overwrite(OverwriteMode::Error).extract_zip(adapter2);
 
     assert!(result.is_err());
 
@@ -155,10 +141,7 @@ fn test_driver_overwrite_skip() {
     // First extraction
     let zip1 = create_simple_zip("test.txt", b"original");
     let adapter1 = ZipAdapter::new(zip1).unwrap();
-    Driver::new(dest.path())
-        .unwrap()
-        .extract_zip(adapter1)
-        .unwrap();
+    Driver::new(dest.path()).unwrap().extract_zip(adapter1).unwrap();
 
     // Second extraction with Skip
     let zip2 = create_simple_zip("test.txt", b"modified");
@@ -185,10 +168,7 @@ fn test_driver_overwrite_overwrite() {
     // First extraction
     let zip1 = create_simple_zip("test.txt", b"original");
     let adapter1 = ZipAdapter::new(zip1).unwrap();
-    Driver::new(dest.path())
-        .unwrap()
-        .extract_zip(adapter1)
-        .unwrap();
+    Driver::new(dest.path()).unwrap().extract_zip(adapter1).unwrap();
 
     // Second extraction with Overwrite
     let zip2 = create_simple_zip("test.txt", b"modified");
@@ -245,20 +225,31 @@ fn test_driver_atomic_file_creation() {
     let zip_file = create_simple_zip("existing.txt", b"new content");
 
     let adapter = ZipAdapter::new(zip_file).unwrap();
-    let result = Driver::new(dest.path())
-        .unwrap()
-        .overwrite(OverwriteMode::Error)
-        .extract_zip(adapter);
+    let result =
+        Driver::new(dest.path()).unwrap().overwrite(OverwriteMode::Error).extract_zip(adapter);
 
     // Should fail with AlreadyExists
-    assert!(matches!(
-        result,
-        Err(safe_unzip::Error::AlreadyExists { .. })
-    ));
+    assert!(matches!(result, Err(safe_unzip::Error::AlreadyExists { .. })));
 
     // Original content should be preserved
     let content = std::fs::read_to_string(dest.path().join("existing.txt")).unwrap();
     assert_eq!(content, "original");
 
     println!("✅ Driver atomic file creation works");
+}
+
+#[test]
+fn test_junk_paths_resolution() {
+    let temp = tempfile::tempdir().unwrap();
+    let driver = Driver::new(temp.path()).unwrap().junk_paths(true);
+
+    assert_eq!(driver.resolve_path("dir/subdir/file.txt"), "file.txt");
+    assert_eq!(driver.resolve_path("file.txt"), "file.txt");
+    assert_eq!(driver.resolve_path("nested/folder/"), "folder");
+
+    // Junk-only names resolve to the empty sentinel, meaning "skip this entry".
+    assert_eq!(driver.resolve_path(""), "");
+    assert_eq!(driver.resolve_path("."), "");
+    assert_eq!(driver.resolve_path("a/../.."), "");
+    assert_eq!(driver.resolve_path("/"), "");
 }
